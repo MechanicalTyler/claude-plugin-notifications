@@ -1,0 +1,11 @@
+{
+  "name": "notifications",
+  "version": "1.0.0",
+  "description": "System notifications when Claude completes tasks or stops (macOS + cross-platform)",
+  "license": "MIT",
+  "hooks": {
+    "Notification": "hooks/notification.py",
+    "Stop": "hooks/stop.py",
+    "SubagentStop": "hooks/subagent_stop.py"
+  }
+}
