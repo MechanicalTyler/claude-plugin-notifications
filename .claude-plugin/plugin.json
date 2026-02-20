@@ -1,0 +1,10 @@
+{
+  "name": "notifications",
+  "description": "System notifications when Claude completes tasks or needs your attention (macOS + Slack)",
+  "version": "1.0.0",
+  "author": {
+    "name": "MechanicalTyler"
+  },
+  "license": "MIT",
+  "keywords": ["notifications", "macos", "slack", "hooks"]
+}
