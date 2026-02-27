@@ -102,3 +102,27 @@ def test_elicitation_dialog_sends_both(base_hook_input, transcript_without_ask):
     })
     assert slack_called, "elicitation_dialog must send Slack notification"
     assert macos_called, "elicitation_dialog must send macOS notification"
+
+
+# --- permission_prompt with tool_use-only transcript (no text in latest assistant message) ---
+
+def test_permission_prompt_tool_use_only_transcript_sends_slack(base_hook_input, transcript_tool_use_only):
+    """When permission_prompt fires and transcript has no text blocks, fallback to input message field."""
+    slack_called, _ = load_and_run_hook({
+        **base_hook_input,
+        "notification_type": "permission_prompt",
+        "message": "Claude needs your permission to use Bash",
+        "transcript_path": transcript_tool_use_only,
+    })
+    assert slack_called, "permission_prompt with tool-use-only transcript must send Slack notification"
+
+
+def test_permission_prompt_tool_use_only_transcript_sends_macos(base_hook_input, transcript_tool_use_only):
+    """When permission_prompt fires and transcript has no text blocks, fallback to input message field."""
+    _, macos_called = load_and_run_hook({
+        **base_hook_input,
+        "notification_type": "permission_prompt",
+        "message": "Claude needs your permission to use Bash",
+        "transcript_path": transcript_tool_use_only,
+    })
+    assert macos_called, "permission_prompt with tool-use-only transcript must send macOS notification"

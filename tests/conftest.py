@@ -34,6 +34,15 @@ def transcript_ask_then_no_ask(tmp_path):
 
 
 @pytest.fixture
+def transcript_tool_use_only(tmp_path):
+    """Transcript where last assistant message contains only tool_use blocks (no text)."""
+    src = FIXTURES_DIR / "transcript_tool_use_only.jsonl"
+    dest = tmp_path / "transcript_tool_use_only.jsonl"
+    dest.write_text(src.read_text())
+    return str(dest)
+
+
+@pytest.fixture
 def base_hook_input():
     """Base stdin payload common to all hooks."""
     return {
