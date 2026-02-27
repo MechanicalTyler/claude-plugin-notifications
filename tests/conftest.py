@@ -25,11 +25,20 @@ def transcript_without_ask(tmp_path):
 
 
 @pytest.fixture
+def transcript_ask_then_no_ask(tmp_path):
+    """Transcript where a previous assistant message used AskUserQuestion but the most recent one did not."""
+    src = FIXTURES_DIR / "transcript_ask_then_no_ask.jsonl"
+    dest = tmp_path / "transcript_ask_then_no_ask.jsonl"
+    dest.write_text(src.read_text())
+    return str(dest)
+
+
+@pytest.fixture
 def base_hook_input():
     """Base stdin payload common to all hooks."""
     return {
         "session_id": "test-session-123",
         "transcript_path": "",
-        "cwd": "/tmp/test-project",
+        "cwd": "/fake/test-project",
         "permission_mode": "default",
     }

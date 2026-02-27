@@ -171,6 +171,10 @@ def has_ask_user_question(transcript_path):
                                 log_notification(f"✅ Found AskUserQuestion tool in latest assistant message")
                                 return True
 
+                # We have now examined the most recent assistant message.
+                # Do not fall through to older messages regardless of outcome.
+                break
+
         log_notification("🔍 No AskUserQuestion tool found in latest assistant message")
         return False
 
