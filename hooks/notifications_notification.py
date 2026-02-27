@@ -69,7 +69,7 @@ def main():
             log_message("❌ No session ID, exiting")
             sys.exit(0)
 
-        message = extract_latest_message(transcript_path)
+        message = extract_latest_message(transcript_path) or input_data.get("message", "")
         if not message:
             log_message("⚠️ No message to send")
             sys.exit(0)
