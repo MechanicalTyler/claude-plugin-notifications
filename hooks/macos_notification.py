@@ -171,9 +171,55 @@ def has_ask_user_question(transcript_path):
                                 log_notification(f"✅ Found AskUserQuestion tool in latest assistant message")
                                 return True
 
+                # We have now examined the most recent assistant message.
+                # Do not fall through to older messages regardless of outcome.
+                break
+
         log_notification("🔍 No AskUserQuestion tool found in latest assistant message")
         return False
 
     except Exception as e:
         log_notification(f"❌ Error checking for AskUserQuestion: {e}")
         return False
+
+
+def extract_latest_message(transcript_path):
+    """
+    Extract the latest assistant text message from a JSONL transcript file.
+
+    Returns the text content of the most recent assistant message, or None.
+    """
+    try:
+        if not transcript_path or not Path(transcript_path).exists():
+            log_notification(f"📄 Transcript file not found: {transcript_path}")
+            return None
+
+        messages = []
+        with open(transcript_path, "r", encoding="utf-8") as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if line:
+                    try:
+                        messages.append(json.loads(line))
+                    except json.JSONDecodeError as e:
+                        log_notification(f"⚠️ JSON decode error on line {line_num}: {e}")
+                        continue
+
+        for entry in reversed(messages):
+            message = entry.get("message", {})
+            if message.get("role") == "assistant":
+                content = message.get("content", [])
+                if isinstance(content, str) and content.strip():
+                    return content.strip()
+                elif isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict) and item.get("type") == "text":
+                            text = item.get("text", "")
+                            if text.strip():
+                                return text.strip()
+                break
+
+        return None
+    except Exception as e:
+        log_notification(f"❌ Error extracting message: {e}")
+        return None
