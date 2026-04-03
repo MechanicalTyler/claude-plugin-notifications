@@ -76,3 +76,25 @@ def test_stop_with_ask_slack_hook_type(base_hook_input, transcript_with_ask):
     slack_payloads, _ = load_and_run_stop_hook(hook_input)
     assert slack_payloads[0]["hook_type"] == "stop_needs_input", \
         f"Expected hook_type 'stop_needs_input', got {slack_payloads[0]['hook_type']!r}"
+
+
+def test_stop_skips_all_notifications_in_subagent_context(base_hook_input, transcript_without_ask):
+    """Stop hook must not notify when agent_type is present (subagent context)."""
+    hook_input = {
+        **base_hook_input,
+        "transcript_path": transcript_without_ask,
+        "agent_type": "Explore",  # real agent_type value from Claude Code SubagentStop schema
+    }
+    slack_payloads, macos_subtitles = load_and_run_stop_hook(hook_input)
+    assert len(slack_payloads) == 0, "Stop hook must not send Slack in subagent context"
+    assert len(macos_subtitles) == 0, "Stop hook must not send macOS notification in subagent context"
+
+
+def test_stop_still_notifies_when_agent_type_absent(base_hook_input, transcript_without_ask):
+    """Stop hook must still notify when agent_type is absent (main agent context)."""
+    hook_input = {**base_hook_input, "transcript_path": transcript_without_ask}
+    # Ensure agent_type is not present
+    assert "agent_type" not in hook_input
+    slack_payloads, macos_subtitles = load_and_run_stop_hook(hook_input)
+    assert len(slack_payloads) == 1, "Stop hook must send Slack in main agent context"
+    assert len(macos_subtitles) == 1, "Stop hook must send macOS notification in main agent context"
