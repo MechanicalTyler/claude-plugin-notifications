@@ -53,6 +53,9 @@ def main():
         input_data = json.load(sys.stdin)
         session_id = input_data.get("session_id", "")
         transcript_path = input_data.get("transcript_path", "")
+        if "agent_type" in input_data:
+            log_message(f"🤖 Subagent session ({input_data['agent_type']!r}), skipping notification")
+            sys.exit(0)
 
         if not session_id:
             log_message("❌ No session ID, exiting")
