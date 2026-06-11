@@ -24,6 +24,20 @@ except ImportError:
     extract_latest_message = macos_notification.extract_latest_message
     has_ask_user_question = macos_notification.has_ask_user_question
 
+try:
+    from attention_hub_client import report_state, macos_enabled, slack_enabled
+except ImportError:
+    import importlib.util
+    hub_spec = importlib.util.spec_from_file_location(
+        "attention_hub_client",
+        Path(__file__).parent / "attention_hub_client.py"
+    )
+    attention_hub_client = importlib.util.module_from_spec(hub_spec)
+    hub_spec.loader.exec_module(attention_hub_client)
+    report_state = attention_hub_client.report_state
+    macos_enabled = attention_hub_client.macos_enabled
+    slack_enabled = attention_hub_client.slack_enabled
+
 
 def log_message(message):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -62,27 +76,39 @@ def main():
             sys.exit(0)
 
         message = extract_latest_message(transcript_path)
-        if not message:
-            log_message("⚠️ No message to send")
-            sys.exit(0)
 
         needs_input = has_ask_user_question(transcript_path)
         if needs_input:
             subtitle = "Needs Input"
             sound = "Glass"
             hook_type = "stop_needs_input"
+            hub_state = "needs_input"
         else:
             subtitle = "Task Complete"
             sound = "Hero"
             hook_type = "stop_complete"
+            hub_state = "done"
 
-        log_message(f"📤 Notifying both channels — subtitle: {subtitle!r}, hook_type: {hook_type!r}")
+        hub_success = report_state(session_id, input_data.get("cwd", ""), hub_state, message)
+        log_message(f"{'✅' if hub_success else '❌'} Hub ({hub_state})")
 
-        slack_success = send_to_slack_app(session_id, message, hook_type)
-        log_message(f"{'✅' if slack_success else '❌'} Slack")
+        if not message:
+            log_message("⚠️ No message to send")
+            sys.exit(0)
 
-        macos_success = send_macos_notification(message, subtitle=subtitle, sound=sound)
-        log_message(f"{'✅' if macos_success else '❌'} macOS")
+        log_message(f"📤 Notifying channels — subtitle: {subtitle!r}, hook_type: {hook_type!r}")
+
+        if slack_enabled():
+            slack_success = send_to_slack_app(session_id, message, hook_type)
+            log_message(f"{'✅' if slack_success else '❌'} Slack")
+        else:
+            log_message("⏭️ Slack disabled via CLAUDE_NOTIFY_SLACK")
+
+        if macos_enabled():
+            macos_success = send_macos_notification(message, subtitle=subtitle, sound=sound)
+            log_message(f"{'✅' if macos_success else '❌'} macOS")
+        else:
+            log_message("⏭️ macOS disabled via CLAUDE_NOTIFY_MACOS")
 
         sys.exit(0)
 

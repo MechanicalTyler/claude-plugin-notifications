@@ -23,6 +23,20 @@ except ImportError:
     send_macos_notification = macos_notification.send_macos_notification
     extract_latest_message = macos_notification.extract_latest_message
 
+try:
+    from attention_hub_client import report_state, macos_enabled, slack_enabled
+except ImportError:
+    import importlib.util
+    hub_spec = importlib.util.spec_from_file_location(
+        "attention_hub_client",
+        Path(__file__).parent / "attention_hub_client.py"
+    )
+    attention_hub_client = importlib.util.module_from_spec(hub_spec)
+    hub_spec.loader.exec_module(attention_hub_client)
+    report_state = attention_hub_client.report_state
+    macos_enabled = attention_hub_client.macos_enabled
+    slack_enabled = attention_hub_client.slack_enabled
+
 # Notification types that mean the agent is blocked and needs user action.
 ACTIONABLE_NOTIFICATION_TYPES = {"permission_prompt", "idle_prompt", "elicitation_dialog"}
 
@@ -70,17 +84,27 @@ def main():
             sys.exit(0)
 
         message = extract_latest_message(transcript_path) or input_data.get("message", "")
+
+        hub_success = report_state(session_id, input_data.get("cwd", ""), "waiting", message)
+        log_message(f"{'✅' if hub_success else '❌'} Hub (waiting)")
+
         if not message:
             log_message("⚠️ No message to send")
             sys.exit(0)
 
         log_message(f"📤 Sending notifications for actionable type: {notification_type!r}")
 
-        slack_success = send_to_slack_app(session_id, message, f"notification_{notification_type}")
-        log_message(f"{'✅' if slack_success else '❌'} Slack")
+        if slack_enabled():
+            slack_success = send_to_slack_app(session_id, message, f"notification_{notification_type}")
+            log_message(f"{'✅' if slack_success else '❌'} Slack")
+        else:
+            log_message("⏭️ Slack disabled via CLAUDE_NOTIFY_SLACK")
 
-        macos_success = send_macos_notification(message, subtitle="Needs Attention", sound="Glass")
-        log_message(f"{'✅' if macos_success else '❌'} macOS")
+        if macos_enabled():
+            macos_success = send_macos_notification(message, subtitle="Needs Attention", sound="Glass")
+            log_message(f"{'✅' if macos_success else '❌'} macOS")
+        else:
+            log_message("⏭️ macOS disabled via CLAUDE_NOTIFY_MACOS")
 
         sys.exit(0)
 
