@@ -25,6 +25,7 @@ import os
 import re
 import threading
 import time
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -124,10 +125,19 @@ class AttentionStore:
                 data = json.load(f)
             sessions = data.get("sessions", {})
             if isinstance(sessions, dict):
-                self._sessions = {
-                    sid: record for sid, record in sessions.items()
-                    if isinstance(record, dict) and record.get("session_id")
-                }
+                now = self._now()
+                for sid, record in sessions.items():
+                    if not (isinstance(record, dict) and record.get("session_id")):
+                        continue
+                    if record.get("state") not in VALID_STATES:
+                        continue
+                    for time_field in ("state_since", "last_update"):
+                        if not isinstance(record.get(time_field), (int, float)):
+                            record[time_field] = now
+                    record.setdefault("project", "unknown")
+                    record.setdefault("host", "unknown")
+                    record["message"] = str(record.get("message") or "")
+                    self._sessions[sid] = record
         except FileNotFoundError:
             pass
         except (json.JSONDecodeError, OSError, AttributeError) as e:
@@ -170,6 +180,8 @@ class AttentionHubHandler(BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length", 0))
             event = json.loads(self.rfile.read(length).decode("utf-8"))
+            if not isinstance(event, dict):
+                raise ValueError("event body must be a JSON object")
             record = self.store.upsert(event)
         except (ValueError, json.JSONDecodeError) as e:
             self._send_json(400, {"error": str(e)})
@@ -181,7 +193,7 @@ class AttentionHubHandler(BaseHTTPRequestHandler):
         if not match:
             self._send_json(404, {"error": "not found"})
             return
-        if self.store.delete(match.group(1)):
+        if self.store.delete(urllib.parse.unquote(match.group(1))):
             self._send_json(200, {"ok": True})
         else:
             self._send_json(404, {"error": "unknown session"})

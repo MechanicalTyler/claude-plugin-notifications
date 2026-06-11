@@ -13,6 +13,7 @@ CLAUDE_NOTIFY_SLACK) shared by the hook scripts.
 import json
 import os
 import socket
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -114,4 +115,5 @@ def remove_session(session_id):
     """Ask the hub to forget a session. Swallows every failure; returns success bool."""
     if not session_id:
         return False
-    return _request(f"{get_hub_url()}/api/sessions/{session_id}", "DELETE")
+    quoted_id = urllib.parse.quote(str(session_id), safe="")
+    return _request(f"{get_hub_url()}/api/sessions/{quoted_id}", "DELETE")

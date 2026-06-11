@@ -156,11 +156,18 @@ def test_hooks_exit_zero_when_hub_down(base_hook_input, transcript_without_ask, 
     for script, extra in [
         ("notifications_user_prompt_submit.py", {"prompt": "hi"}),
         ("notifications_session_end.py", {"reason": "exit"}),
+        ("notifications_notification.py",
+         {"notification_type": "permission_prompt", "transcript_path": transcript_without_ask}),
+        ("notifications_stop.py", {"transcript_path": transcript_without_ask}),
     ]:
         spec = importlib.util.spec_from_file_location(
             script.replace(".py", ""), HOOKS_DIR / script
         )
-        with patch("sys.stdin", StringIO(json.dumps({**base_hook_input, **extra}))):
+        with patch("sys.stdin", StringIO(json.dumps({**base_hook_input, **extra}))), \
+             patch("requests.post") as mock_post, \
+             patch("subprocess.run") as mock_subprocess:
+            mock_post.return_value = MagicMock(status_code=200, text="ok")
+            mock_subprocess.return_value = MagicMock(returncode=0, stderr="")
             mod = importlib.util.module_from_spec(spec)
             exit_code = 0
             try:

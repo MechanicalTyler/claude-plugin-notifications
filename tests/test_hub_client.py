@@ -123,6 +123,33 @@ def test_report_state_posts_event_to_hub(monkeypatch):
     assert captured["body"]["state"] == "waiting"
 
 
+def test_report_state_slow_hub_no_exception(monkeypatch):
+    # Why: a hub that accepts the connection but never answers (slow DNS/network)
+    # must surface as a swallowed timeout, never an exception in the hook.
+    import socket
+    monkeypatch.setenv("CLAUDE_ATTENTION_HUB_URL", "http://hub.example:8765")
+    client = load_client()
+    with patch("urllib.request.urlopen", side_effect=socket.timeout("timed out")):
+        assert client.report_state("s", "/srv/app", "waiting", "msg") is False
+
+
+def test_remove_session_quotes_special_characters(monkeypatch):
+    # Why: session IDs are interpolated into the URL path; reserved characters
+    # must be percent-encoded or the hub can never delete what it stored.
+    monkeypatch.setenv("CLAUDE_ATTENTION_HUB_URL", "http://hub.example:8765")
+    client = load_client()
+    captured = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        return MagicMock(status=200)
+
+    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        client.remove_session("odd id/1")
+
+    assert captured["url"] == "http://hub.example:8765/api/sessions/odd%20id%2F1"
+
+
 def test_remove_session_sends_delete(monkeypatch):
     # Why: SessionEnd removal must target DELETE /api/sessions/{id}; a wrong verb
     # or path would leave dead rows on the dashboard forever.

@@ -130,6 +130,21 @@ def test_state_survives_restart(tmp_path):
     assert sessions[0]["message"] == "Q?"
 
 
+def test_legacy_state_record_missing_time_fields_loads(tmp_path):
+    # Why: a hand-edited or older-format state file without state_since/last_update
+    # must not KeyError every list_sessions call and blank the dashboard forever.
+    hub = load_hub()
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps({"sessions": {
+        "legacy": {"session_id": "legacy", "state": "working"}
+    }}))
+    store = hub.AttentionStore(str(state_file))
+    sessions = store.list_sessions()
+    assert len(sessions) == 1
+    assert sessions[0]["session_id"] == "legacy"
+    assert sessions[0]["state_seconds"] >= 0
+
+
 def test_corrupt_state_file_starts_empty(tmp_path):
     # Why: a truncated/corrupt JSON file must not crash the hub on start; it
     # degrades to an empty session list.
@@ -234,6 +249,30 @@ def test_http_invalid_event_rejected(hub_server):
     except urllib.error.HTTPError as e:
         status = e.code
     assert status == 400
+    _, listing = http_json(f"{hub_server}/api/sessions")
+    assert listing["sessions"] == []
+
+
+def test_http_non_object_event_rejected_with_400(hub_server):
+    # Why: a JSON array/string body must produce a clean 400, not an uncaught
+    # AttributeError that kills the handler thread with no response.
+    req = urllib.request.Request(
+        f"{hub_server}/api/events", data=b'["not", "an", "object"]', method="POST",
+        headers={"Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=5)
+        status = 200
+    except urllib.error.HTTPError as e:
+        status = e.code
+    assert status == 400
+
+
+def test_http_delete_percent_encoded_session_id(hub_server):
+    # Why: the hook client percent-encodes session IDs; the hub must decode the
+    # path or IDs with reserved characters could never be removed.
+    http_json(f"{hub_server}/api/events", "POST", make_event(session_id="odd id/1"))
+    status, _ = http_json(f"{hub_server}/api/sessions/odd%20id%2F1", "DELETE")
+    assert status == 200
     _, listing = http_json(f"{hub_server}/api/sessions")
     assert listing["sessions"] == []
 
