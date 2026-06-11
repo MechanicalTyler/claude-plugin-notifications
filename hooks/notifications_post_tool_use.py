@@ -9,7 +9,9 @@ import sys
 from pathlib import Path
 
 try:
-    from attention_hub_client import report_state, log_hub, get_session_name, clear_waiting_marker
+    from attention_hub_client import (
+        report_state, log_hub, get_session_name, clear_waiting_marker,
+    )
 except ImportError:
     import importlib.util
     hub_spec = importlib.util.spec_from_file_location(
@@ -25,21 +27,24 @@ except ImportError:
 
 
 def main():
-    # UserPromptSubmit: the user answered this session, so attention is addressed.
-    # Report "working" to the attention hub; never block or error the session.
+    # PostToolUse: a tool can only complete after any pending permission was
+    # granted, so a completing tool proves the session is no longer blocked.
+    # This fires after EVERY tool call, so the waiting-marker check gates all
+    # work: no marker -> exit instantly with zero network activity. The marker
+    # is cleared BEFORE the hub POST so a hub outage costs one delayed attempt,
+    # not one per subsequent tool call. Never block or error the session.
     try:
         input_data = json.load(sys.stdin)
         session_id = input_data.get("session_id", "")
         if not session_id:
             sys.exit(0)
 
-        # A new prompt supersedes any pending waiting state; consume the marker
-        # so PostToolUse does not send a redundant "working" later.
-        clear_waiting_marker(session_id)
+        if not clear_waiting_marker(session_id):
+            sys.exit(0)
 
         success = report_state(session_id, input_data.get("cwd", ""), "working",
                                session_name=get_session_name(input_data))
-        log_hub(f"UserPromptSubmit -> working for {session_id}: {'ok' if success else 'hub unreachable'}")
+        log_hub(f"PostToolUse -> working for {session_id}: {'ok' if success else 'hub unreachable'}")
         sys.exit(0)
     except json.JSONDecodeError:
         sys.exit(0)

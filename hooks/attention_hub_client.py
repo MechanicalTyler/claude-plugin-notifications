@@ -105,6 +105,62 @@ def get_session_name(input_data):
         return ""
 
 
+def _waiting_marker_path(session_id):
+    """Marker file path for a session, or None if the ID is unusable.
+
+    The session ID becomes a filename, so reject anything empty, containing
+    path separators, or that is a traversal component. Markers live in a
+    dedicated subdirectory of ~/.claude/notifications/ so all of the plugin's
+    transient state sits under one gitignorable path.
+    """
+    session_id = str(session_id or "").strip()
+    if (not session_id or "/" in session_id or "\\" in session_id
+            or "\x00" in session_id or session_id in (".", "..")):
+        return None
+    return Path.home() / ".claude" / "notifications" / "waiting-markers" / session_id
+
+
+def set_waiting_marker(session_id):
+    """Record that the hub was told this session is waiting on the user.
+
+    Returns True on success. Never raises — any filesystem error means the
+    marker simply is not set and PostToolUse stays on its fast path.
+    """
+    try:
+        path = _waiting_marker_path(session_id)
+        if path is None:
+            return False
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+        return True
+    except Exception:
+        return False
+
+
+def has_waiting_marker(session_id):
+    """True if the session has a waiting marker. Never raises."""
+    try:
+        path = _waiting_marker_path(session_id)
+        return path is not None and path.is_file()
+    except Exception:
+        return False
+
+
+def clear_waiting_marker(session_id):
+    """Remove the session's waiting marker; return True if it existed.
+
+    Never raises — any filesystem error behaves as "no marker".
+    """
+    try:
+        path = _waiting_marker_path(session_id)
+        if path is None or not path.is_file():
+            return False
+        path.unlink()
+        return True
+    except Exception:
+        return False
+
+
 def build_event_payload(session_id, cwd, state, message=None, session_name=None):
     """Build the state-event payload identifying this session to the hub."""
     snippet = (message or "").strip()

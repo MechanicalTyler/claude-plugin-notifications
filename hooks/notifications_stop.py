@@ -25,7 +25,9 @@ except ImportError:
     has_ask_user_question = macos_notification.has_ask_user_question
 
 try:
-    from attention_hub_client import report_state, macos_enabled, slack_enabled, get_session_name
+    from attention_hub_client import (
+        report_state, macos_enabled, slack_enabled, get_session_name, clear_waiting_marker,
+    )
 except ImportError:
     import importlib.util
     hub_spec = importlib.util.spec_from_file_location(
@@ -38,6 +40,7 @@ except ImportError:
     macos_enabled = attention_hub_client.macos_enabled
     slack_enabled = attention_hub_client.slack_enabled
     get_session_name = attention_hub_client.get_session_name
+    clear_waiting_marker = attention_hub_client.clear_waiting_marker
 
 
 def log_message(message):
@@ -75,6 +78,10 @@ def main():
         if not session_id:
             log_message("❌ No session ID, exiting")
             sys.exit(0)
+
+        # End of turn: consume any waiting marker. Covers the denied-permission
+        # path (no tool ran) so the next turn cannot report stale "working".
+        clear_waiting_marker(session_id)
 
         message = extract_latest_message(transcript_path)
 

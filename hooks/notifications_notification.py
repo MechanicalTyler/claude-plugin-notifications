@@ -24,7 +24,9 @@ except ImportError:
     extract_latest_message = macos_notification.extract_latest_message
 
 try:
-    from attention_hub_client import report_state, macos_enabled, slack_enabled, get_session_name
+    from attention_hub_client import (
+        report_state, macos_enabled, slack_enabled, get_session_name, set_waiting_marker,
+    )
 except ImportError:
     import importlib.util
     hub_spec = importlib.util.spec_from_file_location(
@@ -37,6 +39,7 @@ except ImportError:
     macos_enabled = attention_hub_client.macos_enabled
     slack_enabled = attention_hub_client.slack_enabled
     get_session_name = attention_hub_client.get_session_name
+    set_waiting_marker = attention_hub_client.set_waiting_marker
 
 # Notification types that mean the agent is blocked and needs user action.
 ACTIONABLE_NOTIFICATION_TYPES = {"permission_prompt", "idle_prompt", "elicitation_dialog"}
@@ -85,6 +88,10 @@ def main():
             sys.exit(0)
 
         message = extract_latest_message(transcript_path) or input_data.get("message", "")
+
+        # Drop the waiting marker even if the hub POST fails: intent matters,
+        # and a later redundant "working" report is harmless.
+        set_waiting_marker(session_id)
 
         hub_success = report_state(session_id, input_data.get("cwd", ""), "waiting", message,
                                    session_name=get_session_name(input_data))
