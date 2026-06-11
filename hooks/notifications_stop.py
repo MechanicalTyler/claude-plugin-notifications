@@ -25,7 +25,7 @@ except ImportError:
     has_ask_user_question = macos_notification.has_ask_user_question
 
 try:
-    from attention_hub_client import report_state, macos_enabled, slack_enabled
+    from attention_hub_client import report_state, macos_enabled, slack_enabled, get_session_name
 except ImportError:
     import importlib.util
     hub_spec = importlib.util.spec_from_file_location(
@@ -37,6 +37,7 @@ except ImportError:
     report_state = attention_hub_client.report_state
     macos_enabled = attention_hub_client.macos_enabled
     slack_enabled = attention_hub_client.slack_enabled
+    get_session_name = attention_hub_client.get_session_name
 
 
 def log_message(message):
@@ -89,7 +90,8 @@ def main():
             hook_type = "stop_complete"
             hub_state = "done"
 
-        hub_success = report_state(session_id, input_data.get("cwd", ""), hub_state, message)
+        hub_success = report_state(session_id, input_data.get("cwd", ""), hub_state, message,
+                                   session_name=get_session_name(input_data))
         log_message(f"{'✅' if hub_success else '❌'} Hub ({hub_state})")
 
         if not message:

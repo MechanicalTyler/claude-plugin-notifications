@@ -31,6 +31,80 @@ def make_event(session_id="sess-1", state="working", project="proj", host="mac",
     }
 
 
+# --- Session name storage ---
+
+def test_upsert_stores_session_name(tmp_path):
+    # Why: the dashboard labels a row by session name when one is set; the store
+    # must accept, persist, and echo the field or the feature is invisible.
+    hub = load_hub()
+    store = hub.AttentionStore(str(tmp_path / "state.json"))
+    store.upsert({**make_event(), "session_name": "tester"})
+    assert store.list_sessions()[0]["session_name"] == "tester"
+
+
+def test_upsert_session_name_defaults_empty(tmp_path):
+    # Why: events from older clients omit session_name entirely; the store must
+    # default it to "" so the dashboard's fallback-to-project logic has a value.
+    hub = load_hub()
+    store = hub.AttentionStore(str(tmp_path / "state.json"))
+    store.upsert(make_event())
+    assert store.list_sessions()[0]["session_name"] == ""
+
+
+def test_upsert_session_name_sticky_across_events(tmp_path):
+    # Why: not every hook event re-derives the name (and a transient transcript
+    # read failure sends ""); a known name must survive name-less updates instead
+    # of flickering back to the project label.
+    hub = load_hub()
+    store = hub.AttentionStore(str(tmp_path / "state.json"))
+    store.upsert({**make_event(), "session_name": "tester"})
+    store.upsert(make_event(state="done"))
+    assert store.list_sessions()[0]["session_name"] == "tester"
+
+
+def test_upsert_session_name_update_wins(tmp_path):
+    # Why: /rename can happen mid-session; the newest non-empty name must replace
+    # the stored one, otherwise renames never propagate to the dashboard.
+    hub = load_hub()
+    store = hub.AttentionStore(str(tmp_path / "state.json"))
+    store.upsert({**make_event(), "session_name": "old-name"})
+    store.upsert({**make_event(), "session_name": "tester"})
+    assert store.list_sessions()[0]["session_name"] == "tester"
+
+
+def test_upsert_session_name_clamped(tmp_path):
+    # Why: session_name is client-supplied input rendered on the dashboard; the
+    # hub trusts no client to truncate for it (same rule as project/host).
+    hub = load_hub()
+    store = hub.AttentionStore(str(tmp_path / "state.json"))
+    store.upsert({**make_event(), "session_name": "n" * 5000})
+    assert len(store.list_sessions()[0]["session_name"]) <= hub.FIELD_MAX_CHARS
+
+
+def test_load_sanitizes_session_name(tmp_path):
+    # Why: the state file is hand-editable JSON; a missing or non-string
+    # session_name must load as a clamped string, never crash the hub at boot.
+    hub = load_hub()
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps({"sessions": {
+        "named": {"session_id": "named", "state": "working", "session_name": "x" * 5000},
+        "legacy": {"session_id": "legacy", "state": "working"},
+    }}))
+    store = hub.AttentionStore(str(state_file))
+    by_id = {s["session_id"]: s for s in store.list_sessions()}
+    assert len(by_id["named"]["session_name"]) <= hub.FIELD_MAX_CHARS
+    assert by_id["legacy"]["session_name"] == ""
+
+
+def test_dashboard_displays_session_name(tmp_path):
+    # Why: the whole feature — a named session shows its name on the row's second
+    # line in place of the hostname; unnamed sessions keep the hostname. Guards
+    # the dashboard JS actually consuming the session_name field.
+    hub = load_hub()
+    assert "session_name" in hub.DASHBOARD_HTML
+    assert "s.session_name || s.host" in hub.DASHBOARD_HTML
+
+
 # --- Store: upsert / list / delete ---
 
 def test_upsert_creates_session(tmp_path):

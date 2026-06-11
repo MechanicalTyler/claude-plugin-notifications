@@ -18,7 +18,7 @@ Many concurrent Claude sessions (local, docker, remote servers) make macOS/Slack
 - **Yellow** — `done` (task complete, awaiting your review)
 - **Green** — `working` (you answered; Claude is busy)
 
-Rows sort needs-attention first, show project, host, time in state, the latest message snippet, and last-update age, refresh every 3 seconds, and have a per-row dismiss control for crashed/abandoned sessions. Sessions silent for over 24 hours are pruned automatically.
+Rows sort needs-attention first, show project, host, time in state, the latest message snippet, and last-update age, refresh every 3 seconds, and have a per-row dismiss control for crashed/abandoned sessions. Sessions silent for over 24 hours are pruned automatically. When a session has been named (via `/rename`), the name is shown in place of the host on its row.
 
 ### Starting the hub
 
