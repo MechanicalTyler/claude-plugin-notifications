@@ -43,6 +43,14 @@ def transcript_tool_use_only(tmp_path):
 
 
 @pytest.fixture
+def marker_home(tmp_path, monkeypatch):
+    """Redirect HOME to tmp_path so waiting-marker files (and hook logs) never
+    touch the real ~/.claude. Returns the marker directory path."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    return tmp_path / ".claude" / "notifications" / "waiting-markers"
+
+
+@pytest.fixture
 def base_hook_input():
     """Base stdin payload common to all hooks."""
     return {
