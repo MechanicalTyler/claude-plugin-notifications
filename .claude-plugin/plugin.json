@@ -1,6 +1,6 @@
 {
   "name": "notifications",
-  "description": "System notifications when Claude completes tasks or needs your attention (macOS + Slack)",
+  "description": "System notifications when Claude completes tasks or needs input (macOS + Slack), plus a self-hosted attention hub dashboard tracking which sessions are waiting on you",
   "version": "1.3.0",
   "author": {
     "name": "MechanicalTyler"
