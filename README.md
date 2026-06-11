@@ -1,17 +1,80 @@
 # notifications
 
-System notifications when Claude completes tasks or needs input.
+System notifications when Claude completes tasks or needs input, plus a self-hosted attention hub that tracks which of your Claude sessions is waiting on you.
 
 ## What it does
 
-- **Notification hook**: Sends message to Slack app + macOS notification when Claude needs user input (AskUserQuestion detected)
-- **Stop hook**: Sends message to Slack app + macOS "Task Complete" notification when Claude finishes
-- **SubagentStop hook**: Sends message to Slack app when a subagent finishes (no macOS notification for subtasks)
+- **Notification hook**: Sends message to Slack app + macOS notification when Claude needs user input (actionable types only); reports `waiting` to the attention hub
+- **Stop hook**: Sends message to Slack app + macOS "Task Complete" notification when Claude finishes; reports `needs_input` or `done` to the attention hub (subagent sessions are skipped entirely)
+- **UserPromptSubmit hook**: Reports `working` to the attention hub — answering a session automatically clears its needs-attention state
+- **SessionEnd hook**: Removes the session from the attention hub
+- **SubagentStop hook**: No-op (subagents never notify)
+
+## Attention hub
+
+Many concurrent Claude sessions (local, docker, remote servers) make macOS/Slack notifications spammy and hard to track. The attention hub is a small self-hosted server every session reports to; its web dashboard shows one color-coded row per session:
+
+- **Red** — `waiting` (blocked on a permission/question prompt) or `needs_input` (finished its turn by asking you something)
+- **Yellow** — `done` (task complete, awaiting your review)
+- **Green** — `working` (you answered; Claude is busy)
+
+Rows sort needs-attention first, show project, host, time in state, the latest message snippet, and last-update age, refresh every 3 seconds, and have a per-row dismiss control for crashed/abandoned sessions. Sessions silent for over 24 hours are pruned automatically.
+
+### Starting the hub
+
+The hub is a manual-start, zero-dependency Python script (run it in tmux/screen; it does not survive reboot):
+
+```bash
+uv run hub/attention_hub.py
+```
+
+Options:
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--port` | `8765` | Port to listen on |
+| `--bind` | `0.0.0.0` | Bind address (`127.0.0.1` for localhost only) |
+| `--state-file` | `~/.claude/attention_hub_state.json` | JSON persistence file (sessions survive hub restarts) |
+| `--prune-hours` | `24` | Drop sessions silent for this many hours |
+
+Open `http://localhost:8765/` for the dashboard.
+
+### Docker containers and remote servers
+
+Hooks find the hub via `CLAUDE_ATTENTION_HUB_URL` (default `http://localhost:8765`). Point it at the hub host's reachable address and optionally set a friendly host label:
+
+```bash
+# in a docker container
+export CLAUDE_ATTENTION_HUB_URL=http://host.docker.internal:8765
+export CLAUDE_HOST_LABEL=docker-build-box
+
+# on a remote server (hub reachable over VPN/LAN)
+export CLAUDE_ATTENTION_HUB_URL=http://10.0.0.5:8765
+export CLAUDE_HOST_LABEL=staging-server
+```
+
+If the hub is down or unreachable, hooks degrade gracefully: they never block or error a Claude session, and macOS/Slack notifications still work.
+
+### Security
+
+The hub has **no authentication or TLS** and is intended for a trusted private network only (localhost, LAN, VPN/tailnet). Dashboard rows expose project names and assistant message snippets. If remote machines do not need direct access, bind to localhost (`--bind 127.0.0.1`) or a VPN interface.
+
+## Environment variables
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `CLAUDE_ATTENTION_HUB_URL` | `http://localhost:8765` | Attention hub base URL |
+| `CLAUDE_HOST_LABEL` | machine hostname | Host name shown on the dashboard |
+| `CLAUDE_NOTIFY_MACOS` | enabled | Set to `0`/`false`/`no`/`off` to disable macOS notifications |
+| `CLAUDE_NOTIFY_SLACK` | enabled | Set to `0`/`false`/`no`/`off` to disable Slack notifications |
+
+Both notification channels behave exactly as before when the flags are unset.
 
 ## Requirements
 
-- macOS: `brew install terminal-notifier`
+- macOS notifications: `brew install terminal-notifier`
 - Slack app: must be running at `http://localhost:8080` (optional, gracefully degrades)
+- Attention hub: Python 3.8+ (stdlib only), started manually (optional, gracefully degrades)
 
 ## Installation
 
@@ -23,6 +86,12 @@ Add to `~/.claude/settings.json`:
     "notifications@local": { "path": "/path/to/notifications" }
   }
 }
+```
+
+## Running tests
+
+```bash
+uv run --with pytest --with requests python -m pytest tests/
 ```
 
 ## License
