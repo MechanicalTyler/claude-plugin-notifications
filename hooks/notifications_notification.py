@@ -89,7 +89,7 @@ def main():
 
         message = extract_latest_message(transcript_path) or input_data.get("message", "")
 
-        # Drop the waiting marker even if the hub POST fails: intent matters,
+        # Set the waiting marker even if the hub POST fails: intent matters,
         # and a later redundant "working" report is harmless.
         set_waiting_marker(session_id)
 
