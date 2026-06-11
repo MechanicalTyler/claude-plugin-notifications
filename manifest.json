@@ -1,6 +1,6 @@
 {
   "name": "notifications",
-  "version": "1.1.2",
+  "version": "1.2.0",
   "description": "System notifications when Claude needs your attention (macOS + Slack)",
   "license": "MIT",
   "hooks": {
