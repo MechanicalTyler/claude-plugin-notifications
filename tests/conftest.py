@@ -1,5 +1,4 @@
 # tests/conftest.py
-import json
 import pytest
 from pathlib import Path
 
@@ -40,6 +39,14 @@ def transcript_tool_use_only(tmp_path):
     dest = tmp_path / "transcript_tool_use_only.jsonl"
     dest.write_text(src.read_text())
     return str(dest)
+
+
+@pytest.fixture
+def marker_home(tmp_path, monkeypatch):
+    """Redirect HOME to tmp_path so waiting-marker files (and hook logs) never
+    touch the real ~/.claude. Returns the marker directory path."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    return tmp_path / ".claude" / "notifications" / "waiting-markers"
 
 
 @pytest.fixture

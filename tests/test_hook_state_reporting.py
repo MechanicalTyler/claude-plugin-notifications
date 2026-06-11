@@ -194,6 +194,125 @@ def test_unnamed_session_reports_empty_name(base_hook_input, transcript_without_
     assert events[0]["session_name"] == ""
 
 
+# --- Waiting marker lifecycle across hooks ---
+
+def set_marker(marker_home, session_id="test-session-123"):
+    """Drop a waiting marker for a session, as the Notification hook would."""
+    marker_home.mkdir(parents=True, exist_ok=True)
+    (marker_home / session_id).touch()
+
+
+def test_actionable_notification_sets_waiting_marker(base_hook_input, transcript_without_ask, marker_home):
+    # Why: the marker is the local record that the hub was told "waiting" — without
+    # it, PostToolUse can never know the session resumed after a permission prompt.
+    run_hook_capture_hub("notifications_notification.py", {
+        **base_hook_input,
+        "notification_type": "permission_prompt",
+        "transcript_path": transcript_without_ask,
+    })
+    assert (marker_home / "test-session-123").is_file()
+
+
+def test_non_actionable_notification_sets_no_marker(base_hook_input, transcript_without_ask, marker_home):
+    # Why: a marker for a non-blocked session would make the next tool call send a
+    # spurious "working" report — markers must track only real waiting states.
+    run_hook_capture_hub("notifications_notification.py", {
+        **base_hook_input,
+        "notification_type": "auth_success",
+        "transcript_path": transcript_without_ask,
+    })
+    assert not (marker_home / "test-session-123").exists()
+
+
+def test_post_tool_use_with_marker_reports_working_and_clears(base_hook_input, marker_home):
+    # Why: a tool can only complete after a pending permission was granted, so the
+    # hub must flip to "working" exactly once and the marker must be consumed.
+    set_marker(marker_home)
+    events = hub_events(run_hook_capture_hub("notifications_post_tool_use.py", {
+        **base_hook_input,
+        "tool_name": "Bash",
+    }))
+    assert len(events) == 1
+    assert events[0]["state"] == "working"
+    assert events[0]["session_id"] == "test-session-123"
+    assert not (marker_home / "test-session-123").exists()
+
+
+def test_post_tool_use_without_marker_reports_nothing(base_hook_input, marker_home):
+    # Why: PostToolUse fires after every tool call forever; without a marker it must
+    # make zero network calls or an unreachable hub adds 2s latency to every tool.
+    events = hub_events(run_hook_capture_hub("notifications_post_tool_use.py", {
+        **base_hook_input,
+        "tool_name": "Bash",
+    }))
+    assert events == []
+
+
+def test_post_tool_use_without_session_id_reports_nothing(base_hook_input, marker_home):
+    # Why: without a session ID there is no marker to key and no hub row to update;
+    # the hook must stay silent and exit 0 rather than send a garbage event.
+    set_marker(marker_home)
+    hook_input = {**base_hook_input, "tool_name": "Bash"}
+    hook_input["session_id"] = ""
+    events = hub_events(run_hook_capture_hub("notifications_post_tool_use.py", hook_input))
+    assert events == []
+    assert (marker_home / "test-session-123").is_file()
+
+
+def test_user_prompt_submit_clears_marker(base_hook_input, marker_home):
+    # Why: a new prompt is an authoritative "user is engaged" signal — a leftover
+    # marker would make the next tool call send a redundant "working" report.
+    set_marker(marker_home)
+    run_hook_capture_hub("notifications_user_prompt_submit.py", {
+        **base_hook_input,
+        "prompt": "please continue",
+    })
+    assert not (marker_home / "test-session-123").exists()
+
+
+def test_stop_clears_marker(base_hook_input, transcript_without_ask, marker_home):
+    # Why: a denied permission runs no tool, so Stop is the hook that must consume
+    # the marker — otherwise the first tool of the NEXT turn reports stale "working".
+    set_marker(marker_home)
+    run_hook_capture_hub("notifications_stop.py", {
+        **base_hook_input,
+        "transcript_path": transcript_without_ask,
+    })
+    assert not (marker_home / "test-session-123").exists()
+
+
+def test_session_end_clears_marker(base_hook_input, marker_home):
+    # Why: ended sessions must not leak marker files into ~/.claude — and a recycled
+    # session ID must never inherit a stale waiting state.
+    set_marker(marker_home)
+    run_hook_capture_hub("notifications_session_end.py", {
+        **base_hook_input,
+        "reason": "exit",
+    })
+    assert not (marker_home / "test-session-123").exists()
+
+
+def test_post_tool_use_exits_zero_when_hub_down(base_hook_input, marker_home, monkeypatch):
+    # Why: graceful degradation — a dead hub must never error the new hook, and the
+    # marker must be cleared FIRST so the 2s timeout is paid once, not per tool call.
+    monkeypatch.setenv("CLAUDE_ATTENTION_HUB_URL", "http://127.0.0.1:1")
+    set_marker(marker_home)
+    spec = importlib.util.spec_from_file_location(
+        "notifications_post_tool_use", HOOKS_DIR / "notifications_post_tool_use.py"
+    )
+    with patch("sys.stdin", StringIO(json.dumps({**base_hook_input, "tool_name": "Bash"}))):
+        mod = importlib.util.module_from_spec(spec)
+        exit_code = 0
+        try:
+            spec.loader.exec_module(mod)
+            mod.main()
+        except SystemExit as e:
+            exit_code = e.code or 0
+    assert exit_code == 0, "post_tool_use must exit 0 when hub is unreachable"
+    assert not (marker_home / "test-session-123").exists(), \
+        "marker must be cleared even when the hub is down (bounds retries to one)"
+
+
 # --- SessionEnd hook -> removal ---
 
 def test_session_end_removes_session(base_hook_input):
