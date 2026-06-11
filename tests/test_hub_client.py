@@ -133,6 +133,29 @@ def test_report_state_slow_hub_no_exception(monkeypatch):
         assert client.report_state("s", "/srv/app", "waiting", "msg") is False
 
 
+def test_report_state_bounded_total_wall_clock(monkeypatch):
+    # Why: AC4 "never block Claude" — DNS resolution runs before urlopen's socket
+    # timeout applies, so a black-holed hub URL could stall every UserPromptSubmit
+    # for seconds. Total hub-report time must stay bounded by the timeout budget
+    # even when urlopen itself hangs indefinitely.
+    import time
+    monkeypatch.setenv("CLAUDE_ATTENTION_HUB_URL", "http://hub.example:8765")
+    client = load_client()
+    client.HUB_TIMEOUT_SECONDS = 0.2
+
+    def hanging_urlopen(req, timeout=None):
+        time.sleep(10)
+        return MagicMock(status=200)
+
+    start = time.monotonic()
+    with patch("urllib.request.urlopen", side_effect=hanging_urlopen):
+        result = client.report_state("s", "/srv/app", "waiting", "msg")
+    elapsed = time.monotonic() - start
+
+    assert result is False
+    assert elapsed < 2.0
+
+
 def test_remove_session_quotes_special_characters(monkeypatch):
     # Why: session IDs are interpolated into the URL path; reserved characters
     # must be percent-encoded or the hub can never delete what it stored.

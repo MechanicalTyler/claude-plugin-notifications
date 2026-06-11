@@ -13,6 +13,8 @@ CLAUDE_NOTIFY_SLACK) shared by the hook scripts.
 import json
 import os
 import socket
+import threading
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
@@ -85,8 +87,8 @@ def build_event_payload(session_id, cwd, state, message=None):
     }
 
 
-def _request(url, method, body=None):
-    """Issue an HTTP request to the hub. Returns True on 2xx, False otherwise. Never raises."""
+def _issue_request(url, method, body, timeout, result):
+    """Worker body for _request. Stores True/False in result["ok"]. Never raises."""
     try:
         data = json.dumps(body).encode("utf-8") if body is not None else None
         req = urllib.request.Request(
@@ -95,12 +97,44 @@ def _request(url, method, body=None):
             method=method,
             headers={"Content-Type": "application/json"},
         )
-        response = urllib.request.urlopen(req, timeout=HUB_TIMEOUT_SECONDS)
-        status = getattr(response, "status", 200)
-        return 200 <= status < 300
+        response = urllib.request.urlopen(req, timeout=timeout)
+        try:
+            result["ok"] = 200 <= getattr(response, "status", 200) < 300
+        finally:
+            response.close()
+    except urllib.error.HTTPError as e:
+        log_hub(f"Hub rejected request ({method} {url}): HTTP {e.code}")
+        result["ok"] = False
     except Exception as e:
         log_hub(f"Hub unreachable ({method} {url}): {e}")
+        result["ok"] = False
+
+
+def _request(url, method, body=None):
+    """Issue an HTTP request to the hub with a bounded total wall clock.
+
+    urlopen's timeout only covers socket operations — DNS resolution
+    (getaddrinfo) runs before it applies, so a black-holed or unresolvable hub
+    URL could stall a hook well past the budget. The request runs in a daemon
+    thread joined for HUB_TIMEOUT_SECONDS, capping total time regardless of
+    where the delay occurs. Returns True on 2xx, False otherwise. Never raises.
+    """
+    result = {}
+    try:
+        worker = threading.Thread(
+            target=_issue_request,
+            args=(url, method, body, HUB_TIMEOUT_SECONDS, result),
+            daemon=True,
+        )
+        worker.start()
+        worker.join(HUB_TIMEOUT_SECONDS)
+    except Exception as e:
+        log_hub(f"Hub request failed to dispatch ({method} {url}): {e}")
         return False
+    if "ok" not in result:
+        log_hub(f"Hub request exceeded {HUB_TIMEOUT_SECONDS}s budget ({method} {url})")
+        return False
+    return result["ok"]
 
 
 def report_state(session_id, cwd, state, message=None):
