@@ -23,6 +23,7 @@ from pathlib import Path
 DEFAULT_HUB_URL = "http://localhost:8765"
 HUB_TIMEOUT_SECONDS = 2
 MESSAGE_SNIPPET_MAX = 200
+SESSION_NAME_MAX = 256
 _FALSY_VALUES = {"0", "false", "no", "off"}
 
 
@@ -72,13 +73,46 @@ def slack_enabled():
     return _channel_enabled("CLAUDE_NOTIFY_SLACK")
 
 
-def build_event_payload(session_id, cwd, state, message=None):
+def get_session_name(input_data):
+    """Best-effort session name for the hook's session.
+
+    Checks the hook input for a title field first, then falls back to scanning
+    the transcript for the last {"type": "custom-title"} record — the line
+    Claude Code appends on /rename. Returns "" for unnamed sessions. Never
+    raises: a malformed transcript must not break a hook.
+    """
+    try:
+        for key in ("session_title", "custom_title"):
+            value = str(input_data.get(key) or "").strip()
+            if value:
+                return value[:SESSION_NAME_MAX]
+        transcript_path = str(input_data.get("transcript_path") or "")
+        if not transcript_path:
+            return ""
+        name = ""
+        with open(transcript_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if '"custom-title"' not in line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict) and record.get("type") == "custom-title":
+                    name = str(record.get("customTitle") or "").strip()
+        return name[:SESSION_NAME_MAX]
+    except Exception:
+        return ""
+
+
+def build_event_payload(session_id, cwd, state, message=None, session_name=None):
     """Build the state-event payload identifying this session to the hub."""
     snippet = (message or "").strip()
     if len(snippet) > MESSAGE_SNIPPET_MAX:
         snippet = snippet[: MESSAGE_SNIPPET_MAX - 3] + "..."
     return {
         "session_id": session_id,
+        "session_name": (session_name or "").strip()[:SESSION_NAME_MAX],
         "project": os.path.basename(os.path.normpath(cwd)) if cwd else "unknown",
         "host": get_host_label(),
         "state": state,
@@ -137,11 +171,11 @@ def _request(url, method, body=None):
     return result["ok"]
 
 
-def report_state(session_id, cwd, state, message=None):
+def report_state(session_id, cwd, state, message=None, session_name=None):
     """POST a state event to the hub. Swallows every failure; returns success bool."""
     if not session_id:
         return False
-    payload = build_event_payload(session_id, cwd, state, message)
+    payload = build_event_payload(session_id, cwd, state, message, session_name)
     return _request(f"{get_hub_url()}/api/events", "POST", payload)
 
 

@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 try:
-    from attention_hub_client import report_state, log_hub
+    from attention_hub_client import report_state, log_hub, get_session_name
 except ImportError:
     import importlib.util
     hub_spec = importlib.util.spec_from_file_location(
@@ -20,6 +20,7 @@ except ImportError:
     hub_spec.loader.exec_module(attention_hub_client)
     report_state = attention_hub_client.report_state
     log_hub = attention_hub_client.log_hub
+    get_session_name = attention_hub_client.get_session_name
 
 
 def main():
@@ -31,7 +32,8 @@ def main():
         if not session_id:
             sys.exit(0)
 
-        success = report_state(session_id, input_data.get("cwd", ""), "working")
+        success = report_state(session_id, input_data.get("cwd", ""), "working",
+                               session_name=get_session_name(input_data))
         log_hub(f"UserPromptSubmit -> working for {session_id}: {'ok' if success else 'hub unreachable'}")
         sys.exit(0)
     except json.JSONDecodeError:

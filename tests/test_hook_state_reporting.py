@@ -135,6 +135,65 @@ def test_user_prompt_submit_without_session_id_reports_nothing(base_hook_input):
     assert events == []
 
 
+# --- Session name propagation ---
+
+def named_transcript(tmp_path, base_lines_path):
+    """Copy a fixture transcript and append a /rename custom-title record."""
+    base = Path(base_lines_path).read_text(encoding="utf-8")
+    path = tmp_path / "named_transcript.jsonl"
+    path.write_text(
+        base + json.dumps({"type": "custom-title", "customTitle": "tester",
+                           "sessionId": "test-session-123"}) + "\n",
+        encoding="utf-8",
+    )
+    return str(path)
+
+
+def test_stop_reports_session_name_from_transcript(base_hook_input, transcript_without_ask, tmp_path):
+    # Why: a renamed session must reach the hub with its name on the Stop event —
+    # the moment the row turns yellow/red is when the label matters most.
+    events = hub_events(run_hook_capture_hub("notifications_stop.py", {
+        **base_hook_input,
+        "transcript_path": named_transcript(tmp_path, transcript_without_ask),
+    }))
+    assert len(events) == 1
+    assert events[0]["session_name"] == "tester"
+
+
+def test_user_prompt_submit_reports_session_name(base_hook_input, transcript_without_ask, tmp_path):
+    # Why: UserPromptSubmit fires on every prompt, so it is the event that picks up
+    # a fresh /rename fastest; it must carry the name, not just flip state to green.
+    events = hub_events(run_hook_capture_hub("notifications_user_prompt_submit.py", {
+        **base_hook_input,
+        "prompt": "please continue",
+        "transcript_path": named_transcript(tmp_path, transcript_without_ask),
+    }))
+    assert len(events) == 1
+    assert events[0]["session_name"] == "tester"
+
+
+def test_notification_reports_session_name(base_hook_input, transcript_without_ask, tmp_path):
+    # Why: blocked (red) rows are the ones the user triages first; the waiting
+    # event from the Notification hook must be name-labeled like the others.
+    events = hub_events(run_hook_capture_hub("notifications_notification.py", {
+        **base_hook_input,
+        "notification_type": "permission_prompt",
+        "transcript_path": named_transcript(tmp_path, transcript_without_ask),
+    }))
+    assert len(events) == 1
+    assert events[0]["session_name"] == "tester"
+
+
+def test_unnamed_session_reports_empty_name(base_hook_input, transcript_without_ask):
+    # Why: sessions without a /rename must send an empty name so the dashboard
+    # falls back to the project label — not omit the field or send garbage.
+    events = hub_events(run_hook_capture_hub("notifications_stop.py", {
+        **base_hook_input,
+        "transcript_path": transcript_without_ask,
+    }))
+    assert events[0]["session_name"] == ""
+
+
 # --- SessionEnd hook -> removal ---
 
 def test_session_end_removes_session(base_hook_input):

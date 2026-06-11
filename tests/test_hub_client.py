@@ -61,6 +61,87 @@ def test_payload_empty_message_allowed(monkeypatch):
     assert payload["message"] == ""
 
 
+# --- Session name resolution ---
+
+def write_transcript(tmp_path, records):
+    path = tmp_path / "transcript.jsonl"
+    path.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
+    return str(path)
+
+
+def test_session_name_from_hook_input_field():
+    # Why: when Claude Code passes the session title directly in hook input, the
+    # client must use it without touching the transcript — cheapest, freshest source.
+    client = load_client()
+    assert client.get_session_name({"session_title": "tester"}) == "tester"
+    assert client.get_session_name({"custom_title": "tester"}) == "tester"
+
+
+def test_session_name_from_transcript_last_custom_title(tmp_path):
+    # Why: /rename writes {"type":"custom-title"} records into the transcript; the
+    # LAST one is the current name. Picking the first would show stale names after
+    # a re-rename.
+    client = load_client()
+    path = write_transcript(tmp_path, [
+        {"type": "user", "message": {"role": "user", "content": "hi"}},
+        {"type": "custom-title", "customTitle": "old-name", "sessionId": "s1"},
+        {"type": "custom-title", "customTitle": "tester", "sessionId": "s1"},
+        {"type": "assistant", "message": {"role": "assistant", "content": []}},
+    ])
+    assert client.get_session_name({"transcript_path": path}) == "tester"
+
+
+def test_session_name_absent_returns_empty(tmp_path):
+    # Why: unnamed sessions are the norm; the client must return "" (not None, not
+    # an error) so the hub falls back to the project label. Guards the missing-file
+    # path too — get_session_name must never raise inside a hook.
+    client = load_client()
+    path = write_transcript(tmp_path, [
+        {"type": "user", "message": {"role": "user", "content": "hi"}},
+    ])
+    assert client.get_session_name({"transcript_path": path}) == ""
+    assert client.get_session_name({"transcript_path": str(tmp_path / "missing.jsonl")}) == ""
+    assert client.get_session_name({}) == ""
+
+
+def test_payload_includes_session_name(monkeypatch):
+    # Why: the hub can only display a session's name if every event carries it;
+    # dropping the field would silently revert rows to project-only labels.
+    monkeypatch.delenv("CLAUDE_HOST_LABEL", raising=False)
+    client = load_client()
+    payload = client.build_event_payload(
+        "s", "/srv/app", "working", None, session_name="tester"
+    )
+    assert payload["session_name"] == "tester"
+
+
+def test_payload_session_name_defaults_empty(monkeypatch):
+    # Why: callers that pass no name must still produce a valid payload with an
+    # empty session_name — unnamed sessions stay on the project label.
+    monkeypatch.delenv("CLAUDE_HOST_LABEL", raising=False)
+    client = load_client()
+    payload = client.build_event_payload("s", "/srv/app", "working", None)
+    assert payload["session_name"] == ""
+
+
+def test_report_state_posts_session_name(monkeypatch):
+    # Why: report_state is the single delivery path for all hooks; if it drops the
+    # session_name kwarg, no hook can ever surface a name on the dashboard.
+    monkeypatch.setenv("CLAUDE_ATTENTION_HUB_URL", "http://hub.example:8765")
+    monkeypatch.delenv("CLAUDE_HOST_LABEL", raising=False)
+    client = load_client()
+    captured = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured["body"] = json.loads(req.data.decode("utf-8"))
+        return MagicMock(status=200)
+
+    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+        client.report_state("s", "/work/proj", "working", session_name="tester")
+
+    assert captured["body"]["session_name"] == "tester"
+
+
 # --- Hub URL resolution ---
 
 def test_hub_url_default(monkeypatch):

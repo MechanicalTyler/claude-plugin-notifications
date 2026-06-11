@@ -76,6 +76,9 @@ class AttentionStore:
             existing = self._sessions.get(session_id)
             record = {
                 "session_id": session_id,
+                "session_name": _clamp(event.get("session_name")
+                                       or (existing or {}).get("session_name")
+                                       or "", FIELD_MAX_CHARS),
                 "project": _clamp(event.get("project") or (existing or {}).get("project")
                                   or "unknown", FIELD_MAX_CHARS),
                 "host": _clamp(event.get("host") or (existing or {}).get("host")
@@ -148,6 +151,8 @@ class AttentionStore:
                         if not isinstance(record.get(time_field), (int, float)):
                             record[time_field] = now
                     record["session_id"] = sid  # key wins over a hand-edited mismatch
+                    record["session_name"] = _clamp(record.get("session_name") or "",
+                                                    FIELD_MAX_CHARS)
                     record["project"] = _clamp(record.get("project") or "unknown",
                                                FIELD_MAX_CHARS)
                     record["host"] = _clamp(record.get("host") or "unknown",
@@ -314,7 +319,7 @@ function render(sessions) {
     project.textContent = s.project;
     const host = document.createElement("div");
     host.className = "host";
-    host.textContent = s.host;
+    host.textContent = s.session_name || s.host;
     who.append(project, host);
 
     const state = document.createElement("div");
