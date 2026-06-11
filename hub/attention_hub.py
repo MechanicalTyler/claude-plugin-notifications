@@ -38,6 +38,16 @@ DEFAULT_STATE_FILE = str(Path.home() / ".claude" / "attention_hub_state.json")
 STATE_PRIORITY = {"waiting": 0, "needs_input": 0, "done": 1, "working": 2}
 VALID_STATES = set(STATE_PRIORITY)
 
+# Server-side input caps: the hub trusts no client to truncate for it.
+MAX_BODY_BYTES = 64 * 1024
+MESSAGE_MAX_CHARS = 200
+FIELD_MAX_CHARS = 256
+
+
+def _clamp(value, limit):
+    """Coerce to str and truncate to limit characters."""
+    return str(value)[:limit]
+
 SESSION_PATH_RE = re.compile(r"^/api/sessions/([^/]+)$")
 
 
@@ -54,22 +64,24 @@ class AttentionStore:
 
     def upsert(self, event):
         """Create or update a session from a state event. Returns the stored record."""
-        session_id = str(event.get("session_id") or "").strip()
+        session_id = _clamp(event.get("session_id") or "", FIELD_MAX_CHARS).strip()
         state = str(event.get("state") or "").strip()
         if not session_id:
             raise ValueError("event is missing session_id")
         if state not in VALID_STATES:
-            raise ValueError(f"invalid state {state!r}")
+            raise ValueError(f"invalid state {state[:64]!r}")
 
         now = self._now()
         with self._lock:
             existing = self._sessions.get(session_id)
             record = {
                 "session_id": session_id,
-                "project": str(event.get("project") or (existing or {}).get("project") or "unknown"),
-                "host": str(event.get("host") or (existing or {}).get("host") or "unknown"),
+                "project": _clamp(event.get("project") or (existing or {}).get("project")
+                                  or "unknown", FIELD_MAX_CHARS),
+                "host": _clamp(event.get("host") or (existing or {}).get("host")
+                               or "unknown", FIELD_MAX_CHARS),
                 "state": state,
-                "message": str(event.get("message") or ""),
+                "message": _clamp(event.get("message") or "", MESSAGE_MAX_CHARS),
                 "state_since": existing["state_since"]
                 if existing and existing["state"] == state else now,
                 "last_update": now,
@@ -113,7 +125,8 @@ class AttentionStore:
         try:
             self._state_file.parent.mkdir(parents=True, exist_ok=True)
             tmp_path = self._state_file.with_suffix(".tmp")
-            with open(tmp_path, "w", encoding="utf-8") as f:
+            fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump({"sessions": self._sessions}, f, indent=2)
             os.replace(tmp_path, self._state_file)
         except OSError as e:
@@ -134,9 +147,13 @@ class AttentionStore:
                     for time_field in ("state_since", "last_update"):
                         if not isinstance(record.get(time_field), (int, float)):
                             record[time_field] = now
-                    record.setdefault("project", "unknown")
-                    record.setdefault("host", "unknown")
-                    record["message"] = str(record.get("message") or "")
+                    record["session_id"] = sid  # key wins over a hand-edited mismatch
+                    record["project"] = _clamp(record.get("project") or "unknown",
+                                               FIELD_MAX_CHARS)
+                    record["host"] = _clamp(record.get("host") or "unknown",
+                                            FIELD_MAX_CHARS)
+                    record["message"] = _clamp(record.get("message") or "",
+                                               MESSAGE_MAX_CHARS)
                     self._sessions[sid] = record
         except FileNotFoundError:
             pass
@@ -145,6 +162,9 @@ class AttentionStore:
 
 
 class AttentionHubHandler(BaseHTTPRequestHandler):
+    # Keep-alive for the dashboard's 3s poll (every response sets Content-Length).
+    protocol_version = "HTTP/1.1"
+
     @property
     def store(self):
         return self.server.store
@@ -173,12 +193,31 @@ class AttentionHubHandler(BaseHTTPRequestHandler):
         else:
             self._send_json(404, {"error": "not found"})
 
+    def _reject_unread_body(self, status, error):
+        """Reject a request whose body will not be read. The connection must
+        close: with keep-alive the unread body would corrupt the next request."""
+        self.close_connection = True
+        self._send_json(status, {"error": error})
+
     def do_POST(self):
         if self.path != "/api/events":
             self._send_json(404, {"error": "not found"})
             return
+        content_type = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if content_type != "application/json":
+            self._reject_unread_body(415, "Content-Type must be application/json")
+            return
         try:
-            length = int(self.headers.get("Content-Length", 0))
+            length = int(self.headers.get("Content-Length") or "")
+        except ValueError:
+            length = -1
+        if length <= 0:
+            self._reject_unread_body(400, "missing or invalid Content-Length")
+            return
+        if length > MAX_BODY_BYTES:
+            self._reject_unread_body(413, f"request body exceeds {MAX_BODY_BYTES} bytes")
+            return
+        try:
             event = json.loads(self.rfile.read(length).decode("utf-8"))
             if not isinstance(event, dict):
                 raise ValueError("event body must be a JSON object")

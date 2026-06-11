@@ -1,6 +1,7 @@
 # tests/test_attention_hub.py
 import importlib.util
 import json
+import socket
 import threading
 import urllib.request
 from pathlib import Path
@@ -99,6 +100,29 @@ def test_list_sorts_needs_attention_first(tmp_path):
     assert states[:2] in ([["waiting", "needs_input"], ["needs_input", "waiting"]])
     assert states[2] == "done"
     assert states[3] == "working"
+
+
+def test_upsert_truncates_long_message_server_side(tmp_path):
+    # Why: the 200-char snippet cap must hold even when a peer bypasses the hook
+    # client; otherwise a single event bloats in-memory state, the JSON file
+    # rewritten on every event, and every 3s dashboard poll response.
+    hub = load_hub()
+    store = hub.AttentionStore(str(tmp_path / "state.json"))
+    store.upsert(make_event(message="x" * 5000))
+    assert len(store.list_sessions()[0]["message"]) <= hub.MESSAGE_MAX_CHARS
+
+
+def test_upsert_caps_identity_fields(tmp_path):
+    # Why: session_id/project/host are stored verbatim into state and echoed in
+    # every poll response; unbounded identity fields are a storage-exhaustion
+    # vector for any network peer.
+    hub = load_hub()
+    store = hub.AttentionStore(str(tmp_path / "state.json"))
+    store.upsert(make_event(session_id="s" * 5000, project="p" * 5000, host="h" * 5000))
+    row = store.list_sessions()[0]
+    assert len(row["session_id"]) <= hub.FIELD_MAX_CHARS
+    assert len(row["project"]) <= hub.FIELD_MAX_CHARS
+    assert len(row["host"]) <= hub.FIELD_MAX_CHARS
 
 
 def test_delete_removes_session(tmp_path):
@@ -265,6 +289,100 @@ def test_http_non_object_event_rejected_with_400(hub_server):
     except urllib.error.HTTPError as e:
         status = e.code
     assert status == 400
+
+
+def raw_http(base, request_bytes):
+    """Send a hand-crafted HTTP request and return the raw response text.
+
+    Needed for malformed-header cases (negative/oversized/missing
+    Content-Length) that urllib refuses to produce.
+    """
+    host, port = base.replace("http://", "").rsplit(":", 1)
+    with socket.create_connection((host, int(port)), timeout=5) as sock:
+        sock.sendall(request_bytes)
+        sock.settimeout(5)
+        response = b""
+        try:
+            while b"\r\n\r\n" not in response:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+        except socket.timeout:
+            pass
+    return response.decode("latin-1")
+
+
+def test_http_post_negative_content_length_rejected(hub_server):
+    # Why: a negative Content-Length used to reach rfile.read(-1), blocking the
+    # handler thread until the client closed the socket — a trivially repeatable
+    # thread-exhaustion attack under ThreadingHTTPServer. Must be a fast 400.
+    response = raw_http(hub_server, (
+        b"POST /api/events HTTP/1.1\r\n"
+        b"Host: hub\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Content-Length: -1\r\n"
+        b"Connection: close\r\n\r\n"
+    ))
+    assert " 400 " in response.splitlines()[0]
+
+
+def test_http_post_missing_content_length_rejected(hub_server):
+    # Why: a missing or non-numeric Content-Length cannot bound the body read;
+    # the hub must reject it instead of reading garbage or blocking.
+    response = raw_http(hub_server, (
+        b"POST /api/events HTTP/1.1\r\n"
+        b"Host: hub\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Connection: close\r\n\r\n"
+    ))
+    assert " 400 " in response.splitlines()[0]
+
+
+def test_http_post_oversized_content_length_rejected(hub_server):
+    # Why: an attacker-declared huge Content-Length used to buffer the whole
+    # body in memory before parsing (OOM of a 0.0.0.0-bound process). The hub
+    # must refuse oversized bodies up front without reading them.
+    response = raw_http(hub_server, (
+        b"POST /api/events HTTP/1.1\r\n"
+        b"Host: hub\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Content-Length: 100000000\r\n"
+        b"Connection: close\r\n\r\n"
+    ))
+    assert " 413 " in response.splitlines()[0]
+
+
+def test_http_post_wrong_content_type_rejected(hub_server):
+    # Why: a cross-origin "simple request" (text/plain fetch from any web page)
+    # is delivered without a CORS preflight; accepting it would let an arbitrary
+    # page forge or overwrite session rows. Requiring application/json forces a
+    # failing preflight.
+    body = json.dumps(make_event(session_id="csrf")).encode()
+    req = urllib.request.Request(
+        f"{hub_server}/api/events", data=body, method="POST",
+        headers={"Content-Type": "text/plain"})
+    try:
+        urllib.request.urlopen(req, timeout=5)
+        status = 200
+    except urllib.error.HTTPError as e:
+        status = e.code
+    assert status == 415
+    _, listing = http_json(f"{hub_server}/api/sessions")
+    assert listing["sessions"] == []
+
+
+def test_http_invalid_state_rejected_with_400(hub_server):
+    # Why: an unknown state value would render as an uncolored, unsortable row;
+    # the hub must reject it at the API boundary with a clean 400.
+    try:
+        status, _ = http_json(f"{hub_server}/api/events", "POST",
+                              make_event(state="exploded"))
+    except urllib.error.HTTPError as e:
+        status = e.code
+    assert status == 400
+    _, listing = http_json(f"{hub_server}/api/sessions")
+    assert listing["sessions"] == []
 
 
 def test_http_delete_percent_encoded_session_id(hub_server):
