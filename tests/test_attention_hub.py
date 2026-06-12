@@ -96,13 +96,13 @@ def test_load_sanitizes_session_name(tmp_path):
     assert by_id["legacy"]["session_name"] == ""
 
 
-def test_dashboard_displays_session_name(tmp_path):
-    # Why: the whole feature — a named session shows its name on the row's second
-    # line in place of the hostname; unnamed sessions keep the hostname. Guards
-    # the dashboard JS actually consuming the session_name field.
+def test_dashboard_title_is_session_name_with_id_fallback(tmp_path):
+    # Why: the card hierarchy is session-first — the title must be the session
+    # name, falling back to the session ID when unnamed, with the project as
+    # the subtitle. Guards the dashboard JS actually consuming both fields.
     hub = load_hub()
-    assert "session_name" in hub.DASHBOARD_HTML
-    assert "s.session_name || s.host" in hub.DASHBOARD_HTML
+    assert "s.session_name || s.session_id" in hub.DASHBOARD_HTML
+    assert "subtitle.textContent = s.project" in hub.DASHBOARD_HTML
 
 
 # --- Store: upsert / list / delete ---
@@ -484,6 +484,49 @@ def make_clock_store(hub, tmp_path, start=1000.0):
     clock = {"now": start}
     store = hub.AttentionStore(str(tmp_path / "state.json"), now=lambda: clock["now"])
     return clock, store
+
+
+# --- Dashboard: expandable cards, force buttons, container badge ---
+
+def test_dashboard_expansion_set_outlives_render(tmp_path):
+    # Why: render() replaces all children every 3 seconds; the set of expanded
+    # session IDs must live OUTSIDE the render pass and be re-applied, or every
+    # open card collapses itself on the next poll.
+    hub = load_hub()
+    assert "const expandedIds = new Set()" in hub.DASHBOARD_HTML
+    assert "expandedIds.has(" in hub.DASHBOARD_HTML
+
+
+def test_dashboard_dismiss_and_force_do_not_toggle_expansion(tmp_path):
+    # Why: dismiss and force-status buttons sit inside the clickable card; their
+    # clicks must not bubble into the expand/collapse toggle.
+    hub = load_hub()
+    assert hub.DASHBOARD_HTML.count("stopPropagation") >= 2
+
+
+def test_dashboard_posts_to_force_state_endpoint(tmp_path):
+    # Why: the force buttons are only useful if they target the real endpoint
+    # with a JSON state body and refresh afterwards.
+    hub = load_hub()
+    assert '"/state"' in hub.DASHBOARD_HTML
+    assert "JSON.stringify({ state:" in hub.DASHBOARD_HTML
+
+
+def test_dashboard_force_buttons_disable_current_state(tmp_path):
+    # Why: forcing the state a session is already in is a no-op; the current
+    # state's button renders disabled so the control communicates that.
+    hub = load_hub()
+    assert "btn.disabled = s.state ===" in hub.DASHBOARD_HTML
+
+
+def test_dashboard_detail_panel_renders_hub_knowledge(tmp_path):
+    # Why: the expanded panel must surface the container badge, the manual
+    # history badge, the full session ID, and the timeline fields the API now
+    # serves — these markers guard the JS actually consuming them.
+    hub = load_hub()
+    for marker in ("is_container", "container", "manual", "entered_at",
+                   "state_seconds", "s.history"):
+        assert marker in hub.DASHBOARD_HTML, f"dashboard must consume {marker!r}"
 
 
 # --- Status history: recording ---

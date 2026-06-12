@@ -362,14 +362,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   h1 { font-size: 1.2rem; font-weight: 600; }
   h1 small { color: #8b939e; font-weight: 400; margin-left: .6rem; }
   #sessions { display: flex; flex-direction: column; gap: .5rem; margin-top: 1rem; }
+  .card { background: #1d2128; border-radius: 8px; border-left: 6px solid #555; }
+  .card.red { border-left-color: #e5534b; }
+  .card.yellow { border-left-color: #d4a72c; }
+  .card.green { border-left-color: #46954a; }
   .row { display: flex; align-items: center; gap: .9rem; padding: .7rem .9rem;
-         background: #1d2128; border-radius: 8px; border-left: 6px solid #555; }
-  .row.red { border-left-color: #e5534b; }
-  .row.yellow { border-left-color: #d4a72c; }
-  .row.green { border-left-color: #46954a; }
+         cursor: pointer; }
   .who { min-width: 16rem; }
-  .project { font-weight: 600; }
-  .host { color: #8b939e; font-size: .85rem; }
+  .title { font-weight: 600; }
+  .subtitle { color: #8b939e; font-size: .85rem; }
   .state { min-width: 10rem; font-size: .9rem; }
   .red .state { color: #e5534b; }
   .yellow .state { color: #d4a72c; }
@@ -380,6 +381,27 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   button.dismiss { background: none; border: 1px solid #3a4048; color: #8b939e;
                    border-radius: 6px; padding: .15rem .55rem; cursor: pointer; }
   button.dismiss:hover { color: #e6e8eb; border-color: #8b939e; }
+  .detail { border-top: 1px solid #2a2f37; padding: .7rem .9rem .9rem;
+            font-size: .85rem; }
+  .detail dl { display: grid; grid-template-columns: 7rem 1fr;
+               gap: .25rem .8rem; margin: 0; }
+  .detail dt { color: #8b939e; }
+  .detail dd { margin: 0; overflow-wrap: anywhere; }
+  .badge { display: inline-block; margin-left: .45rem; padding: 0 .45rem;
+           border-radius: 999px; font-size: .7rem; font-weight: 700;
+           vertical-align: middle; }
+  .badge.container { background: #1f3a5f; color: #79b8ff; }
+  .badge.manual { background: #4a3a10; color: #d4a72c; }
+  .history { list-style: none; margin: 0; padding: 0; }
+  .history li { padding: .1rem 0; color: #b4bac2; }
+  .history .when { color: #8b939e; }
+  .force { margin-top: .6rem; display: flex; gap: .4rem; align-items: center;
+           flex-wrap: wrap; }
+  .force span { color: #8b939e; }
+  .force button { background: none; border: 1px solid #3a4048; color: #b4bac2;
+                  border-radius: 6px; padding: .15rem .55rem; cursor: pointer; }
+  .force button:hover:not(:disabled) { color: #e6e8eb; border-color: #8b939e; }
+  .force button:disabled { opacity: .45; cursor: default; }
   #empty { color: #8b939e; margin-top: 2rem; }
 </style>
 </head>
@@ -395,6 +417,11 @@ const STATE_LABEL = {
   working: "working",
 };
 const STATE_COLOR = { waiting: "red", needs_input: "red", done: "yellow", working: "green" };
+const FORCE_STATES = ["working", "done", "needs_input", "waiting"];
+
+// Expanded card IDs live OUTSIDE render(): the 3s poll re-render replaces all
+// children, and re-applying this set is what keeps open cards open.
+const expandedIds = new Set();
 
 function fmtDuration(seconds) {
   const s = Math.max(0, Math.floor(seconds));
@@ -403,9 +430,94 @@ function fmtDuration(seconds) {
   return Math.floor(s / 3600) + "h" + Math.floor((s % 3600) / 60) + "m";
 }
 
+function fmtTime(epochSeconds) {
+  return new Date(epochSeconds * 1000).toLocaleString();
+}
+
 function dismiss(sessionId) {
   fetch("/api/sessions/" + encodeURIComponent(sessionId), { method: "DELETE" })
     .then(refresh).catch(() => {});
+}
+
+function forceState(sessionId, state) {
+  fetch("/api/sessions/" + encodeURIComponent(sessionId) + "/state", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ state: state }),
+  }).then(refresh).catch(() => {});
+}
+
+function detailField(dl, label, value) {
+  const dt = document.createElement("dt");
+  dt.textContent = label;
+  const dd = document.createElement("dd");
+  if (value instanceof Node) dd.append(value);
+  else dd.textContent = value;
+  dl.append(dt, dd);
+  return dd;
+}
+
+function makeBadge(kind) {
+  const badge = document.createElement("span");
+  badge.className = "badge " + kind;
+  badge.textContent = kind;
+  return badge;
+}
+
+function buildHistoryList(s) {
+  // Durations are derived, not stored: each entry runs until the next entry
+  // starts; the current (last) entry uses the served state_seconds.
+  const list = document.createElement("ul");
+  list.className = "history";
+  const entries = s.history || [];
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    const next = entries[i + 1];
+    const seconds = next ? next.entered_at - entry.entered_at : s.state_seconds;
+    const li = document.createElement("li");
+    li.textContent = (STATE_LABEL[entry.state] || entry.state)
+      + " for " + fmtDuration(seconds);
+    const when = document.createElement("span");
+    when.className = "when";
+    when.textContent = " — since " + fmtTime(entry.entered_at);
+    li.append(when);
+    if (entry.source === "manual") li.append(makeBadge("manual"));
+    list.append(li);
+  }
+  return list;
+}
+
+function buildDetail(s) {
+  const detail = document.createElement("div");
+  detail.className = "detail";
+
+  const dl = document.createElement("dl");
+  const hostField = detailField(dl, "host", s.host);
+  if (s.is_container) hostField.append(makeBadge("container"));
+  detailField(dl, "session id", s.session_id);
+  detailField(dl, "message", s.message || "—");
+  detailField(dl, "last update", fmtDuration(s.age_seconds) + " ago");
+  detailField(dl, "history", buildHistoryList(s));
+  detail.append(dl);
+
+  const force = document.createElement("div");
+  force.className = "force";
+  const label = document.createElement("span");
+  label.textContent = "force status:";
+  force.append(label);
+  for (const state of FORCE_STATES) {
+    const btn = document.createElement("button");
+    btn.textContent = state;
+    btn.disabled = s.state === state;
+    btn.title = "Manually set this session to " + state;
+    btn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      forceState(s.session_id, state);
+    });
+    force.append(btn);
+  }
+  detail.append(force);
+  return detail;
 }
 
 function render(sessions) {
@@ -414,19 +526,26 @@ function render(sessions) {
   document.getElementById("empty").hidden = sessions.length > 0;
   document.getElementById("meta").textContent =
     sessions.length + " session" + (sessions.length === 1 ? "" : "s");
+  const liveIds = new Set(sessions.map((s) => s.session_id));
+  for (const id of expandedIds) {
+    if (!liveIds.has(id)) expandedIds.delete(id);
+  }
   for (const s of sessions) {
+    const card = document.createElement("div");
+    card.className = "card " + (STATE_COLOR[s.state] || "");
+
     const row = document.createElement("div");
-    row.className = "row " + (STATE_COLOR[s.state] || "");
+    row.className = "row";
 
     const who = document.createElement("div");
     who.className = "who";
-    const project = document.createElement("div");
-    project.className = "project";
-    project.textContent = s.project;
-    const host = document.createElement("div");
-    host.className = "host";
-    host.textContent = s.session_name || s.host;
-    who.append(project, host);
+    const title = document.createElement("div");
+    title.className = "title";
+    title.textContent = s.session_name || s.session_id;
+    const subtitle = document.createElement("div");
+    subtitle.className = "subtitle";
+    subtitle.textContent = s.project;
+    who.append(title, subtitle);
 
     const state = document.createElement("div");
     state.className = "state";
@@ -447,10 +566,24 @@ function render(sessions) {
     btn.className = "dismiss";
     btn.textContent = "dismiss";
     btn.title = "Remove this session from the hub";
-    btn.addEventListener("click", () => dismiss(s.session_id));
+    btn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      dismiss(s.session_id);
+    });
 
     row.append(who, state, snippet, age, btn);
-    container.append(row);
+
+    const detail = buildDetail(s);
+    detail.hidden = !expandedIds.has(s.session_id);
+
+    row.addEventListener("click", () => {
+      if (expandedIds.has(s.session_id)) expandedIds.delete(s.session_id);
+      else expandedIds.add(s.session_id);
+      detail.hidden = !expandedIds.has(s.session_id);
+    });
+
+    card.append(row, detail);
+    container.append(card);
   }
 }
 
