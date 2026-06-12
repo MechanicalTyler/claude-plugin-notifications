@@ -142,6 +142,125 @@ def test_report_state_posts_session_name(monkeypatch):
     assert captured["body"]["session_name"] == "tester"
 
 
+# --- Container detection ---
+
+EXT4_ROOT_MOUNTINFO = (
+    "25 0 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n"
+    "26 25 0:5 / /dev rw,nosuid shared:2 - devtmpfs devtmpfs rw\n"
+)
+OVERLAY_ROOT_MOUNTINFO = (
+    "1573 1280 0:211 / / rw,relatime - overlay overlay "
+    "rw,lowerdir=/var/lib/docker/overlay2/l/AAA,upperdir=/var/lib/docker/"
+    "overlay2/x/diff,workdir=/var/lib/docker/overlay2/x/work\n"
+    "1574 1573 0:215 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw\n"
+)
+
+
+def neutralize_container_signals(client, monkeypatch, tmp_path):
+    """Point every detection signal at a clean (non-container) source so tests
+    are deterministic even when the suite itself runs inside a container."""
+    monkeypatch.setattr(client, "CONTAINER_MARKER_FILES",
+                        (str(tmp_path / "no-dockerenv"),
+                         str(tmp_path / "no-containerenv")))
+    mountinfo = tmp_path / "mountinfo"
+    mountinfo.write_text(EXT4_ROOT_MOUNTINFO, encoding="utf-8")
+    monkeypatch.setattr(client, "MOUNTINFO_PATH", str(mountinfo))
+    monkeypatch.delenv("container", raising=False)
+    monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
+
+
+def test_container_detection_clean_environment_false(monkeypatch, tmp_path):
+    # Why: a plain laptop/VM session must NOT be badged as a container — false
+    # positives would make the badge meaningless across a mixed fleet.
+    client = load_client()
+    neutralize_container_signals(client, monkeypatch, tmp_path)
+    assert client.detect_container() is False
+
+
+def test_container_detection_dockerenv_marker(monkeypatch, tmp_path):
+    # Why: /.dockerenv is the canonical Docker marker; its presence alone must
+    # flag the session as containerized.
+    client = load_client()
+    neutralize_container_signals(client, monkeypatch, tmp_path)
+    marker = tmp_path / "dockerenv"
+    marker.touch()
+    monkeypatch.setattr(client, "CONTAINER_MARKER_FILES",
+                        (str(marker), str(tmp_path / "no-containerenv")))
+    assert client.detect_container() is True
+
+
+def test_container_detection_containerenv_marker(monkeypatch, tmp_path):
+    # Why: Podman writes /run/.containerenv instead of /.dockerenv; either
+    # marker file alone must trigger detection.
+    client = load_client()
+    neutralize_container_signals(client, monkeypatch, tmp_path)
+    marker = tmp_path / "containerenv"
+    marker.touch()
+    monkeypatch.setattr(client, "CONTAINER_MARKER_FILES",
+                        (str(tmp_path / "no-dockerenv"), str(marker)))
+    assert client.detect_container() is True
+
+
+def test_container_detection_container_env_var(monkeypatch, tmp_path):
+    # Why: Podman and systemd-nspawn export container=...; the env var alone
+    # must trigger detection even with no marker files.
+    client = load_client()
+    neutralize_container_signals(client, monkeypatch, tmp_path)
+    monkeypatch.setenv("container", "podman")
+    assert client.detect_container() is True
+
+
+def test_container_detection_kubernetes_env(monkeypatch, tmp_path):
+    # Why: Kubernetes pods expose KUBERNETES_SERVICE_HOST but may lack Docker/
+    # Podman markers; the variable alone must trigger detection.
+    client = load_client()
+    neutralize_container_signals(client, monkeypatch, tmp_path)
+    monkeypatch.setenv("KUBERNETES_SERVICE_HOST", "10.96.0.1")
+    assert client.detect_container() is True
+
+
+def test_container_detection_overlay_root_fallback(monkeypatch, tmp_path):
+    # Why: some dev containers (verified empirically in this repo's own dev
+    # container) expose no marker or env signal, but their root filesystem is
+    # an overlayfs mount — the mountinfo fallback must catch them.
+    client = load_client()
+    neutralize_container_signals(client, monkeypatch, tmp_path)
+    mountinfo = tmp_path / "mountinfo-overlay"
+    mountinfo.write_text(OVERLAY_ROOT_MOUNTINFO, encoding="utf-8")
+    monkeypatch.setattr(client, "MOUNTINFO_PATH", str(mountinfo))
+    assert client.detect_container() is True
+
+
+def test_container_detection_unreadable_mountinfo_false(monkeypatch, tmp_path):
+    # Why: detection runs inside hooks, which must never raise; an unreadable
+    # or missing mountinfo (non-Linux hosts) degrades to "not a container".
+    client = load_client()
+    neutralize_container_signals(client, monkeypatch, tmp_path)
+    monkeypatch.setattr(client, "MOUNTINFO_PATH", str(tmp_path / "missing"))
+    assert client.detect_container() is False
+
+
+def test_payload_carries_container_flag_true(monkeypatch, tmp_path):
+    # Why: the hub can only badge a session if every event carries the flag;
+    # build_event_payload is the single payload source for all hooks.
+    monkeypatch.delenv("CLAUDE_HOST_LABEL", raising=False)
+    client = load_client()
+    neutralize_container_signals(client, monkeypatch, tmp_path)
+    monkeypatch.setenv("KUBERNETES_SERVICE_HOST", "10.96.0.1")
+    payload = client.build_event_payload("s", "/srv/app", "working", None)
+    assert payload["is_container"] is True
+
+
+def test_payload_carries_container_flag_false(monkeypatch, tmp_path):
+    # Why: non-container sessions must send an explicit False (not omit the
+    # field) so the hub never has to guess.
+    monkeypatch.delenv("CLAUDE_HOST_LABEL", raising=False)
+    client = load_client()
+    neutralize_container_signals(client, monkeypatch, tmp_path)
+    payload = client.build_event_payload("s", "/srv/app", "working", None)
+    assert payload["is_container"] is False
+
+
 # --- Hub URL resolution ---
 
 def test_hub_url_default(monkeypatch):
