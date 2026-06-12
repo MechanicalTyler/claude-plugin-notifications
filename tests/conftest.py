@@ -41,6 +41,16 @@ def transcript_tool_use_only(tmp_path):
     return str(dest)
 
 
+@pytest.fixture(autouse=True)
+def _neutral_notification_channel_env(monkeypatch):
+    """Why: the suite must be hermetic — developer/CI shells commonly export
+    CLAUDE_NOTIFY_MACOS/CLAUDE_NOTIFY_SLACK=false to silence real
+    notifications, which would flip every channel-gated hook test. Tests that
+    exercise the flags set them explicitly via monkeypatch on top of this."""
+    monkeypatch.delenv("CLAUDE_NOTIFY_MACOS", raising=False)
+    monkeypatch.delenv("CLAUDE_NOTIFY_SLACK", raising=False)
+
+
 @pytest.fixture
 def marker_home(tmp_path, monkeypatch):
     """Redirect HOME to tmp_path so waiting-marker files (and hook logs) never
