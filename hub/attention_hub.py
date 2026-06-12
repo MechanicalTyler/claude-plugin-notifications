@@ -43,12 +43,17 @@ MAX_BODY_BYTES = 64 * 1024
 MESSAGE_MAX_CHARS = 200
 FIELD_MAX_CHARS = 256
 
+# Bounded per-session status-transition history (oldest entries drop first).
+HISTORY_MAX = 20
+HISTORY_SOURCES = {"hook", "manual"}
+
 
 def _clamp(value, limit):
     """Coerce to str and truncate to limit characters."""
     return str(value)[:limit]
 
 SESSION_PATH_RE = re.compile(r"^/api/sessions/([^/]+)$")
+SESSION_STATE_PATH_RE = re.compile(r"^/api/sessions/([^/]+)/state$")
 
 
 class AttentionStore:
@@ -74,6 +79,13 @@ class AttentionStore:
         now = self._now()
         with self._lock:
             existing = self._sessions.get(session_id)
+            history = list((existing or {}).get("history") or [])
+            if existing is None or existing["state"] != state:
+                history.append({"state": state, "entered_at": now, "source": "hook"})
+            if "is_container" in event:
+                is_container = bool(event.get("is_container"))
+            else:
+                is_container = bool((existing or {}).get("is_container", False))
             record = {
                 "session_id": session_id,
                 "session_name": _clamp(event.get("session_name")
@@ -88,8 +100,36 @@ class AttentionStore:
                 "state_since": existing["state_since"]
                 if existing and existing["state"] == state else now,
                 "last_update": now,
+                "history": history[-HISTORY_MAX:],
+                "is_container": is_container,
             }
             self._sessions[session_id] = record
+            self._save()
+            return dict(record)
+
+    def force_state(self, session_id, state):
+        """Manually override a known session's state (dashboard force-status).
+
+        Appends a history entry with source "manual" and persists. The next
+        genuine hook event replaces the override like any other state change.
+        Returns the updated record, or None when the session is unknown — a
+        manual override never creates a session. The message is left unchanged.
+        """
+        if state not in VALID_STATES:
+            raise ValueError(f"invalid state {str(state)[:64]!r}")
+        now = self._now()
+        with self._lock:
+            record = self._sessions.get(session_id)
+            if record is None:
+                return None
+            if record["state"] != state:
+                record["state"] = state
+                record["state_since"] = now
+                history = list(record.get("history") or [])
+                history.append({"state": state, "entered_at": now,
+                                "source": "manual"})
+                record["history"] = history[-HISTORY_MAX:]
+            record["last_update"] = now
             self._save()
             return dict(record)
 
@@ -159,11 +199,37 @@ class AttentionStore:
                                             FIELD_MAX_CHARS)
                     record["message"] = _clamp(record.get("message") or "",
                                                MESSAGE_MAX_CHARS)
+                    record["history"] = self._sanitize_history(record)
+                    record["is_container"] = bool(record.get("is_container", False))
                     self._sessions[sid] = record
         except FileNotFoundError:
             pass
         except (json.JSONDecodeError, OSError, AttributeError) as e:
             print(f"warning: ignoring unreadable state file {self._state_file}: {e}")
+
+    @staticmethod
+    def _sanitize_history(record):
+        """Well-formed history entries from a loaded record, capped at
+        HISTORY_MAX. Legacy records (or records whose every entry is malformed)
+        seed a one-entry history from the current state and state_since."""
+        clean = []
+        raw = record.get("history")
+        if isinstance(raw, list):
+            for entry in raw:
+                if (isinstance(entry, dict)
+                        and entry.get("state") in VALID_STATES
+                        and isinstance(entry.get("entered_at"), (int, float))):
+                    source = entry.get("source")
+                    clean.append({
+                        "state": entry["state"],
+                        "entered_at": float(entry["entered_at"]),
+                        "source": source if source in HISTORY_SOURCES else "hook",
+                    })
+        if not clean:
+            clean = [{"state": record["state"],
+                      "entered_at": float(record["state_since"]),
+                      "source": "hook"}]
+        return clean[-HISTORY_MAX:]
 
 
 class AttentionHubHandler(BaseHTTPRequestHandler):
@@ -204,31 +270,71 @@ class AttentionHubHandler(BaseHTTPRequestHandler):
         self.close_connection = True
         self._send_json(status, {"error": error})
 
-    def do_POST(self):
-        if self.path != "/api/events":
-            self._send_json(404, {"error": "not found"})
-            return
+    def _read_json_object_body(self):
+        """Validate headers, read the body, and parse a JSON object.
+
+        Returns the parsed dict, or None after an error response has already
+        been sent (the same guards for every POST route: content type, length,
+        size cap, unread-body close, object-shaped JSON)."""
         content_type = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
         if content_type != "application/json":
             self._reject_unread_body(415, "Content-Type must be application/json")
-            return
+            return None
         try:
             length = int(self.headers.get("Content-Length") or "")
         except ValueError:
             length = -1
         if length <= 0:
             self._reject_unread_body(400, "missing or invalid Content-Length")
-            return
+            return None
         if length > MAX_BODY_BYTES:
             self._reject_unread_body(413, f"request body exceeds {MAX_BODY_BYTES} bytes")
+            return None
+        try:
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            if not isinstance(body, dict):
+                raise ValueError("body must be a JSON object")
+        except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as e:
+            self._send_json(400, {"error": str(e)})
+            return None
+        return body
+
+    def do_POST(self):
+        if self.path == "/api/events":
+            self._handle_event_post()
+            return
+        match = SESSION_STATE_PATH_RE.match(self.path)
+        if match:
+            self._handle_force_state(urllib.parse.unquote(match.group(1)))
+            return
+        self._send_json(404, {"error": "not found"})
+
+    def _handle_event_post(self):
+        event = self._read_json_object_body()
+        if event is None:
             return
         try:
-            event = json.loads(self.rfile.read(length).decode("utf-8"))
-            if not isinstance(event, dict):
-                raise ValueError("event body must be a JSON object")
             record = self.store.upsert(event)
-        except (ValueError, json.JSONDecodeError) as e:
+        except ValueError as e:
             self._send_json(400, {"error": str(e)})
+            return
+        self._send_json(200, {"ok": True, "session": record})
+
+    def _handle_force_state(self, session_id):
+        """Manual state override: POST /api/sessions/{id}/state.
+
+        200 with the updated record, 400 on a missing/invalid state or
+        malformed body, 404 on an unknown session. Never creates a session."""
+        body = self._read_json_object_body()
+        if body is None:
+            return
+        try:
+            record = self.store.force_state(session_id, body.get("state"))
+        except ValueError as e:
+            self._send_json(400, {"error": str(e)})
+            return
+        if record is None:
+            self._send_json(404, {"error": "unknown session"})
             return
         self._send_json(200, {"ok": True, "session": record})
 
