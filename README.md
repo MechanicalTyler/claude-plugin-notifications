@@ -19,7 +19,29 @@ Many concurrent Claude sessions (local, docker, remote servers) make macOS/Slack
 - **Yellow** — `done` (task complete, awaiting your review)
 - **Green** — `working` (you answered; Claude is busy)
 
-Rows sort needs-attention first, show project, host, time in state, the latest message snippet, and last-update age, refresh every 3 seconds, and have a per-row dismiss control for crashed/abandoned sessions. Sessions silent for over 24 hours are pruned automatically. When a session has been named (via `/rename`), the name is shown in place of the host on its row.
+Each card's title is the session name (set via `/rename`), falling back to the session ID for unnamed sessions, with the project (repo folder) as the subtitle. Cards sort needs-attention first, show time in state, the latest message snippet, and last-update age, refresh every 3 seconds, and have a per-card dismiss control for crashed/abandoned sessions. Sessions silent for over 24 hours are pruned automatically.
+
+### Expanded card view
+
+Clicking a card expands it; any number of cards may be open at once, and open cards stay open across the 3-second refresh. The detail panel shows:
+
+- **Host** — with a `container` badge when the session runs inside a container
+- **Full session ID** and the **full last message**
+- **Last update** age
+- **Status history** — the last 20 state transitions (most recent first), each with the time it was entered, how long it lasted, and a `manual` badge when the change came from a manual override rather than a hook
+
+### Forcing a status
+
+If the hub falls out of sync with reality (Claude is working but the card still says waiting), the **force status** buttons in the expanded panel set the state by hand — the current state's button is disabled. The override applies immediately and shows up in the history as `manual`, but it is not pinned: the next genuine hook event for the session overwrites it, so the hub always self-heals toward reality.
+
+The buttons call a small API you can also script against:
+
+```bash
+curl -X POST http://localhost:8765/api/sessions/<session-id>/state \
+  -H 'Content-Type: application/json' -d '{"state": "working"}'
+```
+
+Responses: `200` with the updated record, `400` for a missing/invalid state or malformed body, `404` for an unknown session — forcing never creates a session.
 
 ### Starting the hub
 
@@ -53,6 +75,8 @@ export CLAUDE_HOST_LABEL=docker-build-box
 export CLAUDE_ATTENTION_HUB_URL=http://10.0.0.5:8765
 export CLAUDE_HOST_LABEL=staging-server
 ```
+
+Sessions running inside a container are detected automatically — via `/.dockerenv` (Docker), `/run/.containerenv` (Podman), the `container` env var (Podman/systemd-nspawn), `KUBERNETES_SERVICE_HOST` (Kubernetes), or an overlayfs root filesystem as a fallback — and badged `container` in the expanded card. The hostname inside Docker defaults to the bare container ID, so give containers a readable host name with `CLAUDE_HOST_LABEL` (as above) or `docker run --hostname my-name`.
 
 If the hub is down or unreachable, hooks degrade gracefully: they never block or error a Claude session, and macOS/Slack notifications still work.
 
