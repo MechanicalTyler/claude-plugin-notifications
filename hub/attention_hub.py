@@ -43,12 +43,17 @@ MAX_BODY_BYTES = 64 * 1024
 MESSAGE_MAX_CHARS = 200
 FIELD_MAX_CHARS = 256
 
+# Bounded per-session status-transition history (oldest entries drop first).
+HISTORY_MAX = 20
+HISTORY_SOURCES = {"hook", "manual"}
+
 
 def _clamp(value, limit):
     """Coerce to str and truncate to limit characters."""
     return str(value)[:limit]
 
 SESSION_PATH_RE = re.compile(r"^/api/sessions/([^/]+)$")
+SESSION_STATE_PATH_RE = re.compile(r"^/api/sessions/([^/]+)/state$")
 
 
 class AttentionStore:
@@ -74,6 +79,13 @@ class AttentionStore:
         now = self._now()
         with self._lock:
             existing = self._sessions.get(session_id)
+            history = list((existing or {}).get("history") or [])
+            if existing is None or existing["state"] != state:
+                history.append({"state": state, "entered_at": now, "source": "hook"})
+            if "is_container" in event:
+                is_container = bool(event.get("is_container"))
+            else:
+                is_container = bool((existing or {}).get("is_container", False))
             record = {
                 "session_id": session_id,
                 "session_name": _clamp(event.get("session_name")
@@ -88,8 +100,36 @@ class AttentionStore:
                 "state_since": existing["state_since"]
                 if existing and existing["state"] == state else now,
                 "last_update": now,
+                "history": history[-HISTORY_MAX:],
+                "is_container": is_container,
             }
             self._sessions[session_id] = record
+            self._save()
+            return dict(record)
+
+    def force_state(self, session_id, state):
+        """Manually override a known session's state (dashboard force-status).
+
+        Appends a history entry with source "manual" and persists. The next
+        genuine hook event replaces the override like any other state change.
+        Returns the updated record, or None when the session is unknown — a
+        manual override never creates a session. The message is left unchanged.
+        """
+        if state not in VALID_STATES:
+            raise ValueError(f"invalid state {str(state)[:64]!r}")
+        now = self._now()
+        with self._lock:
+            record = self._sessions.get(session_id)
+            if record is None:
+                return None
+            if record["state"] != state:
+                record["state"] = state
+                record["state_since"] = now
+                history = list(record.get("history") or [])
+                history.append({"state": state, "entered_at": now,
+                                "source": "manual"})
+                record["history"] = history[-HISTORY_MAX:]
+            record["last_update"] = now
             self._save()
             return dict(record)
 
@@ -159,11 +199,37 @@ class AttentionStore:
                                             FIELD_MAX_CHARS)
                     record["message"] = _clamp(record.get("message") or "",
                                                MESSAGE_MAX_CHARS)
+                    record["history"] = self._sanitize_history(record)
+                    record["is_container"] = bool(record.get("is_container", False))
                     self._sessions[sid] = record
         except FileNotFoundError:
             pass
         except (json.JSONDecodeError, OSError, AttributeError) as e:
             print(f"warning: ignoring unreadable state file {self._state_file}: {e}")
+
+    @staticmethod
+    def _sanitize_history(record):
+        """Well-formed history entries from a loaded record, capped at
+        HISTORY_MAX. Legacy records (or records whose every entry is malformed)
+        seed a one-entry history from the current state and state_since."""
+        clean = []
+        raw = record.get("history")
+        if isinstance(raw, list):
+            for entry in raw:
+                if (isinstance(entry, dict)
+                        and entry.get("state") in VALID_STATES
+                        and isinstance(entry.get("entered_at"), (int, float))):
+                    source = entry.get("source")
+                    clean.append({
+                        "state": entry["state"],
+                        "entered_at": float(entry["entered_at"]),
+                        "source": source if source in HISTORY_SOURCES else "hook",
+                    })
+        if not clean:
+            clean = [{"state": record["state"],
+                      "entered_at": float(record["state_since"]),
+                      "source": "hook"}]
+        return clean[-HISTORY_MAX:]
 
 
 class AttentionHubHandler(BaseHTTPRequestHandler):
@@ -204,31 +270,71 @@ class AttentionHubHandler(BaseHTTPRequestHandler):
         self.close_connection = True
         self._send_json(status, {"error": error})
 
-    def do_POST(self):
-        if self.path != "/api/events":
-            self._send_json(404, {"error": "not found"})
-            return
+    def _read_json_object_body(self):
+        """Validate headers, read the body, and parse a JSON object.
+
+        Returns the parsed dict, or None after an error response has already
+        been sent (the same guards for every POST route: content type, length,
+        size cap, unread-body close, object-shaped JSON)."""
         content_type = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
         if content_type != "application/json":
             self._reject_unread_body(415, "Content-Type must be application/json")
-            return
+            return None
         try:
             length = int(self.headers.get("Content-Length") or "")
         except ValueError:
             length = -1
         if length <= 0:
             self._reject_unread_body(400, "missing or invalid Content-Length")
-            return
+            return None
         if length > MAX_BODY_BYTES:
             self._reject_unread_body(413, f"request body exceeds {MAX_BODY_BYTES} bytes")
+            return None
+        try:
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            if not isinstance(body, dict):
+                raise ValueError("body must be a JSON object")
+        except (ValueError, json.JSONDecodeError, UnicodeDecodeError) as e:
+            self._send_json(400, {"error": str(e)})
+            return None
+        return body
+
+    def do_POST(self):
+        if self.path == "/api/events":
+            self._handle_event_post()
+            return
+        match = SESSION_STATE_PATH_RE.match(self.path)
+        if match:
+            self._handle_force_state(urllib.parse.unquote(match.group(1)))
+            return
+        self._send_json(404, {"error": "not found"})
+
+    def _handle_event_post(self):
+        event = self._read_json_object_body()
+        if event is None:
             return
         try:
-            event = json.loads(self.rfile.read(length).decode("utf-8"))
-            if not isinstance(event, dict):
-                raise ValueError("event body must be a JSON object")
             record = self.store.upsert(event)
-        except (ValueError, json.JSONDecodeError) as e:
+        except ValueError as e:
             self._send_json(400, {"error": str(e)})
+            return
+        self._send_json(200, {"ok": True, "session": record})
+
+    def _handle_force_state(self, session_id):
+        """Manual state override: POST /api/sessions/{id}/state.
+
+        200 with the updated record, 400 on a missing/invalid state or
+        malformed body, 404 on an unknown session. Never creates a session."""
+        body = self._read_json_object_body()
+        if body is None:
+            return
+        try:
+            record = self.store.force_state(session_id, body.get("state"))
+        except ValueError as e:
+            self._send_json(400, {"error": str(e)})
+            return
+        if record is None:
+            self._send_json(404, {"error": "unknown session"})
             return
         self._send_json(200, {"ok": True, "session": record})
 
@@ -256,14 +362,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   h1 { font-size: 1.2rem; font-weight: 600; }
   h1 small { color: #8b939e; font-weight: 400; margin-left: .6rem; }
   #sessions { display: flex; flex-direction: column; gap: .5rem; margin-top: 1rem; }
+  .card { background: #1d2128; border-radius: 8px; border-left: 6px solid #555; }
+  .card.red { border-left-color: #e5534b; }
+  .card.yellow { border-left-color: #d4a72c; }
+  .card.green { border-left-color: #46954a; }
   .row { display: flex; align-items: center; gap: .9rem; padding: .7rem .9rem;
-         background: #1d2128; border-radius: 8px; border-left: 6px solid #555; }
-  .row.red { border-left-color: #e5534b; }
-  .row.yellow { border-left-color: #d4a72c; }
-  .row.green { border-left-color: #46954a; }
+         cursor: pointer; }
   .who { min-width: 16rem; }
-  .project { font-weight: 600; }
-  .host { color: #8b939e; font-size: .85rem; }
+  .title { font-weight: 600; }
+  .subtitle { color: #8b939e; font-size: .85rem; }
   .state { min-width: 10rem; font-size: .9rem; }
   .red .state { color: #e5534b; }
   .yellow .state { color: #d4a72c; }
@@ -274,6 +381,27 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   button.dismiss { background: none; border: 1px solid #3a4048; color: #8b939e;
                    border-radius: 6px; padding: .15rem .55rem; cursor: pointer; }
   button.dismiss:hover { color: #e6e8eb; border-color: #8b939e; }
+  .detail { border-top: 1px solid #2a2f37; padding: .7rem .9rem .9rem;
+            font-size: .85rem; }
+  .detail dl { display: grid; grid-template-columns: 7rem 1fr;
+               gap: .25rem .8rem; margin: 0; }
+  .detail dt { color: #8b939e; }
+  .detail dd { margin: 0; overflow-wrap: anywhere; }
+  .badge { display: inline-block; margin-left: .45rem; padding: 0 .45rem;
+           border-radius: 999px; font-size: .7rem; font-weight: 700;
+           vertical-align: middle; }
+  .badge.container { background: #1f3a5f; color: #79b8ff; }
+  .badge.manual { background: #4a3a10; color: #d4a72c; }
+  .history { list-style: none; margin: 0; padding: 0; }
+  .history li { padding: .1rem 0; color: #b4bac2; }
+  .history .when { color: #8b939e; }
+  .force { margin-top: .6rem; display: flex; gap: .4rem; align-items: center;
+           flex-wrap: wrap; }
+  .force span { color: #8b939e; }
+  .force button { background: none; border: 1px solid #3a4048; color: #b4bac2;
+                  border-radius: 6px; padding: .15rem .55rem; cursor: pointer; }
+  .force button:hover:not(:disabled) { color: #e6e8eb; border-color: #8b939e; }
+  .force button:disabled { opacity: .45; cursor: default; }
   #empty { color: #8b939e; margin-top: 2rem; }
 </style>
 </head>
@@ -289,6 +417,11 @@ const STATE_LABEL = {
   working: "working",
 };
 const STATE_COLOR = { waiting: "red", needs_input: "red", done: "yellow", working: "green" };
+const FORCE_STATES = ["working", "done", "needs_input", "waiting"];
+
+// Expanded card IDs live OUTSIDE render(): the 3s poll re-render replaces all
+// children, and re-applying this set is what keeps open cards open.
+const expandedIds = new Set();
 
 function fmtDuration(seconds) {
   const s = Math.max(0, Math.floor(seconds));
@@ -297,9 +430,94 @@ function fmtDuration(seconds) {
   return Math.floor(s / 3600) + "h" + Math.floor((s % 3600) / 60) + "m";
 }
 
+function fmtTime(epochSeconds) {
+  return new Date(epochSeconds * 1000).toLocaleString();
+}
+
 function dismiss(sessionId) {
   fetch("/api/sessions/" + encodeURIComponent(sessionId), { method: "DELETE" })
     .then(refresh).catch(() => {});
+}
+
+function forceState(sessionId, state) {
+  fetch("/api/sessions/" + encodeURIComponent(sessionId) + "/state", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ state: state }),
+  }).then(refresh).catch(() => {});
+}
+
+function detailField(dl, label, value) {
+  const dt = document.createElement("dt");
+  dt.textContent = label;
+  const dd = document.createElement("dd");
+  if (value instanceof Node) dd.append(value);
+  else dd.textContent = value;
+  dl.append(dt, dd);
+  return dd;
+}
+
+function makeBadge(kind) {
+  const badge = document.createElement("span");
+  badge.className = "badge " + kind;
+  badge.textContent = kind;
+  return badge;
+}
+
+function buildHistoryList(s) {
+  // Durations are derived, not stored: each entry runs until the next entry
+  // starts; the current (last) entry uses the served state_seconds.
+  const list = document.createElement("ul");
+  list.className = "history";
+  const entries = s.history || [];
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    const next = entries[i + 1];
+    const seconds = next ? next.entered_at - entry.entered_at : s.state_seconds;
+    const li = document.createElement("li");
+    li.textContent = (STATE_LABEL[entry.state] || entry.state)
+      + " for " + fmtDuration(seconds);
+    const when = document.createElement("span");
+    when.className = "when";
+    when.textContent = " — since " + fmtTime(entry.entered_at);
+    li.append(when);
+    if (entry.source === "manual") li.append(makeBadge("manual"));
+    list.append(li);
+  }
+  return list;
+}
+
+function buildDetail(s) {
+  const detail = document.createElement("div");
+  detail.className = "detail";
+
+  const dl = document.createElement("dl");
+  const hostField = detailField(dl, "host", s.host);
+  if (s.is_container) hostField.append(makeBadge("container"));
+  detailField(dl, "session id", s.session_id);
+  detailField(dl, "message", s.message || "—");
+  detailField(dl, "last update", fmtDuration(s.age_seconds) + " ago");
+  detailField(dl, "history", buildHistoryList(s));
+  detail.append(dl);
+
+  const force = document.createElement("div");
+  force.className = "force";
+  const label = document.createElement("span");
+  label.textContent = "force status:";
+  force.append(label);
+  for (const state of FORCE_STATES) {
+    const btn = document.createElement("button");
+    btn.textContent = state;
+    btn.disabled = s.state === state;
+    btn.title = "Manually set this session to " + state;
+    btn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      forceState(s.session_id, state);
+    });
+    force.append(btn);
+  }
+  detail.append(force);
+  return detail;
 }
 
 function render(sessions) {
@@ -308,19 +526,26 @@ function render(sessions) {
   document.getElementById("empty").hidden = sessions.length > 0;
   document.getElementById("meta").textContent =
     sessions.length + " session" + (sessions.length === 1 ? "" : "s");
+  const liveIds = new Set(sessions.map((s) => s.session_id));
+  for (const id of expandedIds) {
+    if (!liveIds.has(id)) expandedIds.delete(id);
+  }
   for (const s of sessions) {
+    const card = document.createElement("div");
+    card.className = "card " + (STATE_COLOR[s.state] || "");
+
     const row = document.createElement("div");
-    row.className = "row " + (STATE_COLOR[s.state] || "");
+    row.className = "row";
 
     const who = document.createElement("div");
     who.className = "who";
-    const project = document.createElement("div");
-    project.className = "project";
-    project.textContent = s.project;
-    const host = document.createElement("div");
-    host.className = "host";
-    host.textContent = s.session_name || s.host;
-    who.append(project, host);
+    const title = document.createElement("div");
+    title.className = "title";
+    title.textContent = s.session_name || s.session_id;
+    const subtitle = document.createElement("div");
+    subtitle.className = "subtitle";
+    subtitle.textContent = s.project;
+    who.append(title, subtitle);
 
     const state = document.createElement("div");
     state.className = "state";
@@ -341,10 +566,24 @@ function render(sessions) {
     btn.className = "dismiss";
     btn.textContent = "dismiss";
     btn.title = "Remove this session from the hub";
-    btn.addEventListener("click", () => dismiss(s.session_id));
+    btn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      dismiss(s.session_id);
+    });
 
     row.append(who, state, snippet, age, btn);
-    container.append(row);
+
+    const detail = buildDetail(s);
+    detail.hidden = !expandedIds.has(s.session_id);
+
+    row.addEventListener("click", () => {
+      if (expandedIds.has(s.session_id)) expandedIds.delete(s.session_id);
+      else expandedIds.add(s.session_id);
+      detail.hidden = !expandedIds.has(s.session_id);
+    });
+
+    card.append(row, detail);
+    container.append(card);
   }
 }
 

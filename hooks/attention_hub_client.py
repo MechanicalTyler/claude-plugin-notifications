@@ -26,6 +26,11 @@ MESSAGE_SNIPPET_MAX = 200
 SESSION_NAME_MAX = 256
 _FALSY_VALUES = {"0", "false", "no", "off"}
 
+# Container-detection signals (module-level so tests can redirect them).
+CONTAINER_MARKER_FILES = ("/.dockerenv", "/run/.containerenv")
+CONTAINER_ENV_VARS = ("container", "KUBERNETES_SERVICE_HOST")
+MOUNTINFO_PATH = "/proc/self/mountinfo"
+
 
 def log_hub(message, log_file="attention_hub_client.log"):
     """Write a timestamped log message to ~/.claude/logs/{log_file}. Never raises."""
@@ -54,6 +59,53 @@ def get_host_label():
         return socket.gethostname() or "unknown-host"
     except Exception:
         return "unknown-host"
+
+
+def _root_is_overlayfs():
+    """True when the root filesystem (/) is an overlayfs mount.
+
+    Reads /proc/self/mountinfo, whose per-line format places the mount point
+    at field 5 and the filesystem type right after the "-" separator. An
+    overlay root is a strong container signal for environments (some dev
+    containers) that expose no marker file or env variable. Never raises;
+    missing/unreadable mountinfo (e.g. non-Linux) means "not detected".
+    """
+    try:
+        with open(MOUNTINFO_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                fields = line.split()
+                if len(fields) < 5 or fields[4] != "/":
+                    continue
+                try:
+                    separator = fields.index("-")
+                except ValueError:
+                    continue
+                if len(fields) > separator + 1:
+                    return fields[separator + 1].startswith("overlay")
+        return False
+    except Exception:
+        return False
+
+
+def detect_container():
+    """Best-effort detection of whether this session runs inside a container.
+
+    Signals (any one suffices): /.dockerenv (Docker), /run/.containerenv
+    (Podman), the `container` env var (Podman/systemd-nspawn),
+    KUBERNETES_SERVICE_HOST (Kubernetes pod), or — as a final fallback — an
+    overlayfs root per /proc/self/mountinfo. Cgroup-text scanning is not used:
+    it is unreliable on cgroup v2. Never raises.
+    """
+    try:
+        for marker in CONTAINER_MARKER_FILES:
+            if os.path.exists(marker):
+                return True
+        for env_var in CONTAINER_ENV_VARS:
+            if os.environ.get(env_var, "").strip():
+                return True
+        return _root_is_overlayfs()
+    except Exception:
+        return False
 
 
 def _channel_enabled(env_var):
@@ -173,6 +225,7 @@ def build_event_payload(session_id, cwd, state, message=None, session_name=None)
         "host": get_host_label(),
         "state": state,
         "message": snippet,
+        "is_container": detect_container(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 

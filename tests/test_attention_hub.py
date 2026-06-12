@@ -96,13 +96,13 @@ def test_load_sanitizes_session_name(tmp_path):
     assert by_id["legacy"]["session_name"] == ""
 
 
-def test_dashboard_displays_session_name(tmp_path):
-    # Why: the whole feature — a named session shows its name on the row's second
-    # line in place of the hostname; unnamed sessions keep the hostname. Guards
-    # the dashboard JS actually consuming the session_name field.
+def test_dashboard_title_is_session_name_with_id_fallback(tmp_path):
+    # Why: the card hierarchy is session-first — the title must be the session
+    # name, falling back to the session ID when unnamed, with the project as
+    # the subtitle. Guards the dashboard JS actually consuming both fields.
     hub = load_hub()
-    assert "session_name" in hub.DASHBOARD_HTML
-    assert "s.session_name || s.host" in hub.DASHBOARD_HTML
+    assert "s.session_name || s.session_id" in hub.DASHBOARD_HTML
+    assert "subtitle.textContent = s.project" in hub.DASHBOARD_HTML
 
 
 # --- Store: upsert / list / delete ---
@@ -478,6 +478,441 @@ def test_dashboard_served_at_root(hub_server):
         page = resp.read().decode()
     assert "/api/sessions" in page, "dashboard must poll the session-list endpoint"
     assert "dismiss" in page.lower(), "dashboard must expose a per-row dismiss control"
+
+
+def make_clock_store(hub, tmp_path, start=1000.0):
+    clock = {"now": start}
+    store = hub.AttentionStore(str(tmp_path / "state.json"), now=lambda: clock["now"])
+    return clock, store
+
+
+# --- Dashboard: expandable cards, force buttons, container badge ---
+
+def test_dashboard_expansion_set_outlives_render(tmp_path):
+    # Why: render() replaces all children every 3 seconds; the set of expanded
+    # session IDs must live OUTSIDE the render pass and be re-applied, or every
+    # open card collapses itself on the next poll.
+    hub = load_hub()
+    assert "const expandedIds = new Set()" in hub.DASHBOARD_HTML
+    assert "expandedIds.has(" in hub.DASHBOARD_HTML
+
+
+def test_dashboard_dismiss_and_force_do_not_toggle_expansion(tmp_path):
+    # Why: dismiss and force-status buttons sit inside the clickable card; their
+    # clicks must not bubble into the expand/collapse toggle.
+    hub = load_hub()
+    assert hub.DASHBOARD_HTML.count("stopPropagation") >= 2
+
+
+def test_dashboard_posts_to_force_state_endpoint(tmp_path):
+    # Why: the force buttons are only useful if they target the real endpoint
+    # with a JSON state body and refresh afterwards.
+    hub = load_hub()
+    assert '"/state"' in hub.DASHBOARD_HTML
+    assert "JSON.stringify({ state:" in hub.DASHBOARD_HTML
+
+
+def test_dashboard_force_buttons_disable_current_state(tmp_path):
+    # Why: forcing the state a session is already in is a no-op; the current
+    # state's button renders disabled so the control communicates that.
+    hub = load_hub()
+    assert "btn.disabled = s.state ===" in hub.DASHBOARD_HTML
+
+
+def test_dashboard_detail_panel_renders_hub_knowledge(tmp_path):
+    # Why: the expanded panel must surface the container badge, the manual
+    # history badge, the full session ID, and the timeline fields the API now
+    # serves — these markers guard the JS actually consuming them.
+    hub = load_hub()
+    for marker in ("is_container", "container", "manual", "entered_at",
+                   "state_seconds", "s.history"):
+        assert marker in hub.DASHBOARD_HTML, f"dashboard must consume {marker!r}"
+
+
+# --- Status history: recording ---
+
+def test_history_appends_entry_on_state_change(tmp_path):
+    # Why: the expanded card's timeline is built from recorded transitions; every
+    # actual state change (including first sighting) must append one entry with
+    # the state, the time it was entered, and source "hook".
+    hub = load_hub()
+    clock, store = make_clock_store(hub, tmp_path)
+    store.upsert(make_event(state="working"))
+    clock["now"] = 1060.0
+    store.upsert(make_event(state="waiting"))
+    history = store.list_sessions()[0]["history"]
+    assert [(e["state"], e["entered_at"], e["source"]) for e in history] == [
+        ("working", 1000.0, "hook"),
+        ("waiting", 1060.0, "hook"),
+    ]
+
+
+def test_history_no_entry_on_same_state_re_report(tmp_path):
+    # Why: hooks re-report "working" on every prompt; a same-state event refreshes
+    # last_update but must not flood the timeline with duplicate entries (mirrors
+    # the existing state_since behavior).
+    hub = load_hub()
+    clock, store = make_clock_store(hub, tmp_path)
+    store.upsert(make_event(state="working"))
+    clock["now"] = 1060.0
+    store.upsert(make_event(state="working"))
+    assert len(store.list_sessions()[0]["history"]) == 1
+
+
+def test_history_capped_with_oldest_dropped(tmp_path):
+    # Why: unbounded history would grow the state file and every 3s poll response
+    # forever; the cap must hold at 20 with the oldest entries dropped first.
+    hub = load_hub()
+    clock, store = make_clock_store(hub, tmp_path)
+    states = ["working", "waiting"]
+    for i in range(25):
+        clock["now"] = 1000.0 + i
+        store.upsert(make_event(state=states[i % 2]))
+    history = store.list_sessions()[0]["history"]
+    assert hub.HISTORY_MAX == 20
+    assert len(history) == hub.HISTORY_MAX
+    assert history[0]["entered_at"] == 1005.0  # five oldest dropped
+    assert history[-1]["entered_at"] == 1024.0
+
+
+def test_history_survives_restart(tmp_path):
+    # Why: the hub is a manual-start script; timelines must be persisted in the
+    # state file and restored on restart, not rebuilt from scratch.
+    hub = load_hub()
+    state_file = str(tmp_path / "state.json")
+    store = hub.AttentionStore(state_file)
+    store.upsert(make_event(state="working"))
+    store.upsert(make_event(state="waiting"))
+    restored = hub.AttentionStore(state_file)
+    history = restored.list_sessions()[0]["history"]
+    assert [e["state"] for e in history] == ["working", "waiting"]
+
+
+# --- Status history: legacy load and sanitizing ---
+
+def test_legacy_record_without_history_seeds_one_entry(tmp_path):
+    # Why: pre-feature state files have records with no history; loading must seed
+    # a one-entry history from the record's current state and state_since so the
+    # dashboard timeline is never empty for old sessions.
+    hub = load_hub()
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps({"sessions": {
+        "legacy": {"session_id": "legacy", "state": "waiting",
+                   "state_since": 111.0, "last_update": 112.0},
+    }}))
+    store = hub.AttentionStore(str(state_file), now=lambda: 200.0)
+    history = store.list_sessions()[0]["history"]
+    assert history == [{"state": "waiting", "entered_at": 111.0, "source": "hook"}]
+
+
+def test_load_discards_malformed_history_entries(tmp_path):
+    # Why: the state file is hand-editable JSON; bogus entries (unknown state,
+    # non-numeric time, non-dict) must be dropped on load, never crash the hub
+    # or render garbage in the timeline.
+    hub = load_hub()
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps({"sessions": {
+        "s": {"session_id": "s", "state": "working",
+              "state_since": 50.0, "last_update": 60.0,
+              "history": [
+                  {"state": "working", "entered_at": 50.0, "source": "hook"},
+                  {"state": "exploded", "entered_at": 51.0, "source": "hook"},
+                  {"state": "waiting", "entered_at": "yesterday", "source": "hook"},
+                  "junk",
+              ]},
+    }}))
+    store = hub.AttentionStore(str(state_file), now=lambda: 200.0)
+    history = store.list_sessions()[0]["history"]
+    assert history == [{"state": "working", "entered_at": 50.0, "source": "hook"}]
+
+
+def test_load_seeds_history_when_all_entries_malformed(tmp_path):
+    # Why: if sanitizing drops every entry the record must fall back to the same
+    # seeding as a legacy record — a session with an empty timeline is a bug.
+    hub = load_hub()
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps({"sessions": {
+        "s": {"session_id": "s", "state": "done",
+              "state_since": 70.0, "last_update": 80.0,
+              "history": ["junk", 42]},
+    }}))
+    store = hub.AttentionStore(str(state_file), now=lambda: 200.0)
+    history = store.list_sessions()[0]["history"]
+    assert history == [{"state": "done", "entered_at": 70.0, "source": "hook"}]
+
+
+def test_load_caps_history_at_limit(tmp_path):
+    # Why: a hand-grown or pre-cap state file must not bypass the 20-entry bound;
+    # the cap is enforced on load as well as on write.
+    hub = load_hub()
+    state_file = tmp_path / "state.json"
+    entries = [{"state": "working" if i % 2 == 0 else "waiting",
+                "entered_at": float(i), "source": "hook"} for i in range(30)]
+    state_file.write_text(json.dumps({"sessions": {
+        "s": {"session_id": "s", "state": "waiting",
+              "state_since": 29.0, "last_update": 29.0, "history": entries},
+    }}))
+    store = hub.AttentionStore(str(state_file), now=lambda: 100.0)
+    history = store.list_sessions()[0]["history"]
+    assert len(history) == hub.HISTORY_MAX
+    assert history[-1]["entered_at"] == 29.0
+
+
+# --- Container flag ---
+
+def test_upsert_stores_container_flag(tmp_path):
+    # Why: the dashboard's container badge only renders if the flag the client
+    # sends is stored and served back by the sessions API.
+    hub = load_hub()
+    store = hub.AttentionStore(str(tmp_path / "state.json"))
+    store.upsert({**make_event(), "is_container": True})
+    assert store.list_sessions()[0]["is_container"] is True
+
+
+def test_container_flag_defaults_false(tmp_path):
+    # Why: events from older clients omit is_container entirely; the store must
+    # default it to False so every served row carries a boolean.
+    hub = load_hub()
+    store = hub.AttentionStore(str(tmp_path / "state.json"))
+    store.upsert(make_event())
+    assert store.list_sessions()[0]["is_container"] is False
+
+
+def test_container_flag_sticky_when_event_omits_it(tmp_path):
+    # Why: a mixed fleet can send events with and without the field for the same
+    # session; an omitting event must keep the previous value, not flicker the
+    # badge off.
+    hub = load_hub()
+    store = hub.AttentionStore(str(tmp_path / "state.json"))
+    store.upsert({**make_event(), "is_container": True})
+    store.upsert(make_event(state="done"))
+    assert store.list_sessions()[0]["is_container"] is True
+
+
+def test_load_defaults_container_flag_false(tmp_path):
+    # Why: pre-feature state files have no is_container; legacy records must load
+    # with the flag defaulting to False instead of crashing or serving None.
+    hub = load_hub()
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps({"sessions": {
+        "legacy": {"session_id": "legacy", "state": "working"},
+    }}))
+    store = hub.AttentionStore(str(state_file))
+    assert store.list_sessions()[0]["is_container"] is False
+
+
+def test_container_flag_survives_restart(tmp_path):
+    # Why: the badge must not disappear when the hub restarts; the flag is part
+    # of the persisted record.
+    hub = load_hub()
+    state_file = str(tmp_path / "state.json")
+    store = hub.AttentionStore(state_file)
+    store.upsert({**make_event(), "is_container": True})
+    restored = hub.AttentionStore(state_file)
+    assert restored.list_sessions()[0]["is_container"] is True
+
+
+# --- Force state: store ---
+
+def test_force_state_updates_record_and_appends_manual_history(tmp_path):
+    # Why: the force-status control exists to correct a stale state by hand; the
+    # store must flip the state, reset state_since, and record the change in
+    # history with source "manual" so the timeline shows who changed what.
+    hub = load_hub()
+    clock, store = make_clock_store(hub, tmp_path)
+    store.upsert(make_event(state="waiting", message="stale?"))
+    clock["now"] = 1060.0
+    record = store.force_state("sess-1", "working")
+    assert record["state"] == "working"
+    assert record["state_since"] == 1060.0
+    assert record["last_update"] == 1060.0
+    last = record["history"][-1]
+    assert (last["state"], last["entered_at"], last["source"]) == \
+        ("working", 1060.0, "manual")
+
+
+def test_force_state_leaves_message_unchanged(tmp_path):
+    # Why: the override corrects only the state; wiping the last message would
+    # destroy context the user may still need to read.
+    hub = load_hub()
+    store = hub.AttentionStore(str(tmp_path / "state.json"))
+    store.upsert(make_event(state="waiting", message="May I run rm?"))
+    record = store.force_state("sess-1", "working")
+    assert record["message"] == "May I run rm?"
+
+
+def test_force_state_unknown_session_returns_none_and_never_creates(tmp_path):
+    # Why: forcing is an operation on an EXISTING session — unlike events it must
+    # signal not-found and never materialize a phantom row.
+    hub = load_hub()
+    store = hub.AttentionStore(str(tmp_path / "state.json"))
+    assert store.force_state("ghost", "working") is None
+    assert store.list_sessions() == []
+
+
+def test_force_state_invalid_state_rejected(tmp_path):
+    # Why: an unknown state would render as an uncolored, unsortable row; the
+    # store must reject it before mutating anything.
+    hub = load_hub()
+    store = hub.AttentionStore(str(tmp_path / "state.json"))
+    store.upsert(make_event(state="waiting"))
+    with pytest.raises(ValueError):
+        store.force_state("sess-1", "exploded")
+    assert store.list_sessions()[0]["state"] == "waiting"
+
+
+def test_force_state_same_state_noop_except_last_update(tmp_path):
+    # Why: re-forcing the current state must not reset the state clock or add a
+    # duplicate timeline entry — only last_update moves.
+    hub = load_hub()
+    clock, store = make_clock_store(hub, tmp_path)
+    store.upsert(make_event(state="waiting"))
+    clock["now"] = 1060.0
+    record = store.force_state("sess-1", "waiting")
+    assert record["state_since"] == 1000.0
+    assert record["last_update"] == 1060.0
+    assert len(record["history"]) == 1
+
+
+def test_forced_state_survives_restart(tmp_path):
+    # Why: a manual correction must persist exactly like a hook-driven change;
+    # losing it on hub restart would silently resurrect the stale state.
+    hub = load_hub()
+    state_file = str(tmp_path / "state.json")
+    store = hub.AttentionStore(state_file)
+    store.upsert(make_event(state="waiting"))
+    store.force_state("sess-1", "working")
+    restored = hub.AttentionStore(state_file)
+    row = restored.list_sessions()[0]
+    assert row["state"] == "working"
+    assert row["history"][-1]["source"] == "manual"
+
+
+def test_hook_event_overwrites_forced_state(tmp_path):
+    # Why: "real events win" — an override is not pinned; the next genuine hook
+    # event replaces it exactly like any other state change, so the hub
+    # self-heals toward reality.
+    hub = load_hub()
+    clock, store = make_clock_store(hub, tmp_path)
+    store.upsert(make_event(state="waiting"))
+    clock["now"] = 1060.0
+    store.force_state("sess-1", "working")
+    clock["now"] = 1120.0
+    store.upsert(make_event(state="needs_input"))
+    row = store.list_sessions()[0]
+    assert row["state"] == "needs_input"
+    assert row["history"][-1]["source"] == "hook"
+
+
+# --- Force state: HTTP endpoint ---
+
+def test_http_force_state_happy_path(hub_server):
+    # Why: the dashboard's force buttons call this endpoint; a 200 must return
+    # the updated record with the manual history entry the timeline renders.
+    http_json(f"{hub_server}/api/events", "POST",
+              make_event(session_id="f1", state="waiting"))
+    status, body = http_json(f"{hub_server}/api/sessions/f1/state", "POST",
+                             {"state": "working"})
+    assert status == 200
+    assert body["session"]["state"] == "working"
+    assert body["session"]["history"][-1]["source"] == "manual"
+    _, listing = http_json(f"{hub_server}/api/sessions")
+    assert listing["sessions"][0]["state"] == "working"
+
+
+def test_http_force_state_percent_encoded_session_id(hub_server):
+    # Why: the dashboard percent-encodes session IDs into the path; the hub must
+    # decode it or sessions with reserved characters could never be forced.
+    http_json(f"{hub_server}/api/events", "POST",
+              make_event(session_id="odd id/1", state="waiting"))
+    status, _ = http_json(f"{hub_server}/api/sessions/odd%20id%2F1/state", "POST",
+                          {"state": "working"})
+    assert status == 200
+
+
+def test_http_force_state_invalid_state_400(hub_server):
+    # Why: an invalid state name must be a clean 400 with the session untouched.
+    http_json(f"{hub_server}/api/events", "POST",
+              make_event(session_id="f2", state="waiting"))
+    try:
+        status, _ = http_json(f"{hub_server}/api/sessions/f2/state", "POST",
+                              {"state": "exploded"})
+    except urllib.error.HTTPError as e:
+        status = e.code
+    assert status == 400
+    _, listing = http_json(f"{hub_server}/api/sessions")
+    assert listing["sessions"][0]["state"] == "waiting"
+
+
+def test_http_force_state_missing_state_400(hub_server):
+    # Why: a body without a state names nothing to force; must be 400, not a
+    # KeyError that kills the handler thread.
+    http_json(f"{hub_server}/api/events", "POST",
+              make_event(session_id="f3", state="waiting"))
+    try:
+        status, _ = http_json(f"{hub_server}/api/sessions/f3/state", "POST", {})
+    except urllib.error.HTTPError as e:
+        status = e.code
+    assert status == 400
+
+
+def test_http_force_state_malformed_body_400(hub_server):
+    # Why: a non-JSON or non-object body must produce a clean 400, mirroring the
+    # /api/events guards.
+    http_json(f"{hub_server}/api/events", "POST",
+              make_event(session_id="f4", state="waiting"))
+    req = urllib.request.Request(
+        f"{hub_server}/api/sessions/f4/state", data=b"{not json", method="POST",
+        headers={"Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=5)
+        status = 200
+    except urllib.error.HTTPError as e:
+        status = e.code
+    assert status == 400
+
+
+def test_http_force_state_unknown_session_404_never_creates(hub_server):
+    # Why: forcing an unknown session must 404 and never create a phantom row —
+    # the semantic difference from /api/events.
+    try:
+        status, _ = http_json(f"{hub_server}/api/sessions/ghost/state", "POST",
+                              {"state": "working"})
+    except urllib.error.HTTPError as e:
+        status = e.code
+    assert status == 404
+    _, listing = http_json(f"{hub_server}/api/sessions")
+    assert listing["sessions"] == []
+
+
+def test_http_force_state_wrong_content_type_rejected(hub_server):
+    # Why: same CSRF reasoning as /api/events — a text/plain cross-origin fetch
+    # must not be able to flip session states from an arbitrary web page.
+    http_json(f"{hub_server}/api/events", "POST",
+              make_event(session_id="f5", state="waiting"))
+    req = urllib.request.Request(
+        f"{hub_server}/api/sessions/f5/state", data=b'{"state": "working"}',
+        method="POST", headers={"Content-Type": "text/plain"})
+    try:
+        urllib.request.urlopen(req, timeout=5)
+        status = 200
+    except urllib.error.HTTPError as e:
+        status = e.code
+    assert status == 415
+
+
+def test_http_sessions_payload_includes_history_and_container_flag(hub_server):
+    # Why: the expanded card renders the timeline and badge from GET
+    # /api/sessions rows; dropping either field makes the feature invisible.
+    http_json(f"{hub_server}/api/events", "POST",
+              {**make_event(session_id="p1", state="working"), "is_container": True})
+    http_json(f"{hub_server}/api/events", "POST",
+              make_event(session_id="p1", state="waiting"))
+    _, listing = http_json(f"{hub_server}/api/sessions")
+    row = listing["sessions"][0]
+    assert row["is_container"] is True
+    assert [e["state"] for e in row["history"]] == ["working", "waiting"]
+    assert all(e["source"] == "hook" for e in row["history"])
 
 
 def test_dashboard_data_one_row_per_session(hub_server):
